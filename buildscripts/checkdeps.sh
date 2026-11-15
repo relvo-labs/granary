@@ -7,7 +7,7 @@ _init() {
 
 	## Minimum required versions for build dependencies
 	GIT_VERSION="1.0"
-	GO_VERSION="1.16"
+	GO_TOOLCHAIN=$(sed -n 's/^toolchain //p' "$(dirname "${BASH_SOURCE[0]}")/../go.mod")
 	OSX_VERSION="10.8"
 	KNAME=$(uname -s)
 	ARCH=$(uname -m)
@@ -110,11 +110,17 @@ assert_check_golang_env() {
 		exit 1
 	fi
 
-	installed_go_version=$(go version | sed 's/^.* go\([0-9.]*\).*$/\1/')
-	if ! check_minimum_version "${GO_VERSION}" "${installed_go_version}"; then
-		echo "Go runtime version '${installed_go_version}' is unsupported. Minimum supported version: ${GO_VERSION} to compile."
-		exit 1
+	installed_go_version=$(go env GOVERSION) || exit 1
+	# go.mod's go directive is language compatibility, not a security floor.
+	# GO-2026-6859 requires both supported minor lines to be checked.
+	if [[ ${installed_go_version} =~ ^go([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+		local major=$((10#${BASH_REMATCH[1]})) minor=$((10#${BASH_REMATCH[2]})) patch=$((10#${BASH_REMATCH[3]}))
+		if ((major > 1 || (major == 1 && (minor > 27 || (minor == 27 && patch >= 4) || (minor == 26 && patch >= 11))))); then
+			return
+		fi
 	fi
+	echo "Go compiler '${installed_go_version}' is unsupported: GO-2026-6859 requires Go 1.26.11+, 1.27.4+, or a newer minor. Use the go.mod toolchain ${GO_TOOLCHAIN}; prerelease and development compilers are not accepted." >&2
+	exit 1
 }
 
 assert_check_deps() {
