@@ -186,6 +186,16 @@ var errMalformedEncoding = errors.New("malformed chunked encoding")
 // chunk is considered too big if its bigger than > 16MiB.
 var errChunkTooBig = errors.New("chunk too big: choose chunk size <= 16MiB")
 
+// streamingReadError keeps framing truncation distinct from the short final
+// block errors accepted by Erasure.Encode. Only a verified terminal chunk may
+// produce io.EOF from a streaming reader.
+func streamingReadError(err error) error {
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return IncompleteBody{}
+	}
+	return err
+}
+
 // newSignV4ChunkedReader returns a new s3ChunkedReader that translates the data read from r
 // out of HTTP "chunked" format before returning it.
 // The s3ChunkedReader returns io.EOF when the final 0-length chunk is read.
@@ -290,11 +300,8 @@ func (cr *s3ChunkedReader) Read(buf []byte) (n int, err error) {
 	var size int
 	for {
 		b, err := cr.reader.ReadByte()
-		if err == io.EOF {
-			err = io.ErrUnexpectedEOF
-		}
 		if err != nil {
-			cr.err = err
+			cr.err = streamingReadError(err)
 			return n, cr.err
 		}
 		if b == ';' { // separating character
@@ -329,11 +336,8 @@ func (cr *s3ChunkedReader) Read(buf []byte) (n int, err error) {
 	// starts with a 16 byte header: len("chunk-signature=") + 64 == 80.
 	var signature [80]byte
 	_, err = io.ReadFull(cr.reader, signature[:])
-	if err == io.EOF {
-		err = io.ErrUnexpectedEOF
-	}
 	if err != nil {
-		cr.err = err
+		cr.err = streamingReadError(err)
 		return n, cr.err
 	}
 	if !bytes.HasPrefix(signature[:], []byte("chunk-signature=")) {
@@ -341,11 +345,8 @@ func (cr *s3ChunkedReader) Read(buf []byte) (n int, err error) {
 		return n, cr.err
 	}
 	b, err := cr.reader.ReadByte()
-	if err == io.EOF {
-		err = io.ErrUnexpectedEOF
-	}
 	if err != nil {
-		cr.err = err
+		cr.err = streamingReadError(err)
 		return n, cr.err
 	}
 	if b != '\r' {
@@ -353,11 +354,8 @@ func (cr *s3ChunkedReader) Read(buf []byte) (n int, err error) {
 		return n, cr.err
 	}
 	b, err = cr.reader.ReadByte()
-	if err == io.EOF {
-		err = io.ErrUnexpectedEOF
-	}
 	if err != nil {
-		cr.err = err
+		cr.err = streamingReadError(err)
 		return n, cr.err
 	}
 	if b != '\n' {
@@ -373,11 +371,8 @@ func (cr *s3ChunkedReader) Read(buf []byte) (n int, err error) {
 
 	// Now, we read the payload and compute its SHA-256 hash.
 	_, err = io.ReadFull(cr.reader, cr.buffer)
-	if err == io.EOF && size != 0 {
-		err = io.ErrUnexpectedEOF
-	}
-	if err != nil && err != io.EOF {
-		cr.err = err
+	if err != nil {
+		cr.err = streamingReadError(err)
 		return n, cr.err
 	}
 
@@ -413,7 +408,11 @@ func (cr *s3ChunkedReader) Read(buf []byte) (n int, err error) {
 	}
 
 	b, err = cr.reader.ReadByte()
-	if b != '\r' || err != nil {
+	if err != nil {
+		cr.err = streamingReadError(err)
+		return n, cr.err
+	}
+	if b != '\r' {
 		if cr.debug {
 			fmt.Printf("want %q, got %q\n", "\r", string(b))
 		}
@@ -421,11 +420,8 @@ func (cr *s3ChunkedReader) Read(buf []byte) (n int, err error) {
 		return n, cr.err
 	}
 	b, err = cr.reader.ReadByte()
-	if err == io.EOF {
-		err = io.ErrUnexpectedEOF
-	}
 	if err != nil {
-		cr.err = err
+		cr.err = streamingReadError(err)
 		return n, cr.err
 	}
 	if b != '\n' {
@@ -451,10 +447,7 @@ func (cr *s3ChunkedReader) readTrailers() error {
 	for {
 		v, err := cr.reader.ReadByte()
 		if err != nil {
-			if err == io.EOF {
-				return io.ErrUnexpectedEOF
-			}
-			return err
+			return streamingReadError(err)
 		}
 		if v != '\r' {
 			valueBuffer.WriteByte(v)
@@ -463,10 +456,7 @@ func (cr *s3ChunkedReader) readTrailers() error {
 		// End of buffer, do not add to value.
 		v, err = cr.reader.ReadByte()
 		if err != nil {
-			if err == io.EOF {
-				return io.ErrUnexpectedEOF
-			}
-			return err
+			return streamingReadError(err)
 		}
 		if v != '\n' {
 			return errMalformedEncoding
@@ -479,10 +469,7 @@ func (cr *s3ChunkedReader) readTrailers() error {
 	for {
 		v, err := cr.reader.ReadByte()
 		if err != nil {
-			if err == io.EOF {
-				return io.ErrUnexpectedEOF
-			}
-			return err
+			return streamingReadError(err)
 		}
 		if v != '\r' {
 			signatureBuffer.WriteByte(v)
@@ -491,10 +478,7 @@ func (cr *s3ChunkedReader) readTrailers() error {
 		var tmp [3]byte
 		_, err = io.ReadFull(cr.reader, tmp[:])
 		if err != nil {
-			if err == io.EOF {
-				return io.ErrUnexpectedEOF
-			}
-			return err
+			return streamingReadError(err)
 		}
 		if string(tmp[:]) != "\n\r\n" {
 			if cr.debug {
@@ -568,7 +552,7 @@ func (cr *s3ChunkedReader) readTrailers() error {
 
 	// Check if we got all we want.
 	if len(wantTrailers) > 0 {
-		return io.ErrUnexpectedEOF
+		return IncompleteBody{}
 	}
 	return nil
 }
@@ -579,7 +563,7 @@ func readCRLF(reader io.Reader) error {
 	buf := make([]byte, 2)
 	_, err := io.ReadFull(reader, buf[:2])
 	if err != nil {
-		return err
+		return streamingReadError(err)
 	}
 	if buf[0] != '\r' || buf[1] != '\n' {
 		return errMalformedEncoding
@@ -597,10 +581,10 @@ func readChunkLine(b *bufio.Reader) ([]byte, []byte, error) {
 		// We always know when EOF is coming.
 		// If the caller asked for a line, there should be a line.
 		switch err {
-		case io.EOF:
-			err = io.ErrUnexpectedEOF
 		case bufio.ErrBufferFull:
 			err = errLineTooLong
+		default:
+			err = streamingReadError(err)
 		}
 		return nil, nil, err
 	}

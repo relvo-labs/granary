@@ -56,7 +56,7 @@ func TestReadChunkLine(t *testing.T) {
 		// Test - 2 - unexpected end of the reader.
 		{
 			bufio.NewReader(readers[1]),
-			io.ErrUnexpectedEOF,
+			IncompleteBody{},
 			nil,
 			nil,
 		},
@@ -151,7 +151,7 @@ func TestReadCRLF(t *testing.T) {
 		// Test - 3 invalid buffer with more characters.
 		{bytes.NewReader([]byte("he\r\n")), errMalformedEncoding},
 		// Test - 4 smaller buffer than expected.
-		{bytes.NewReader([]byte("h")), io.ErrUnexpectedEOF},
+		{bytes.NewReader([]byte("h")), IncompleteBody{}},
 	}
 	for i, tt := range tests {
 		err := readCRLF(tt.reader)
