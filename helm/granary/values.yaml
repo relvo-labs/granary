@@ -10,19 +10,20 @@ fullnameOverride: ""
 ##
 clusterDomain: cluster.local
 
-## The Granary image is not yet published. "unpublished" is a placeholder,
-## not a release tag. Build this checkout and override repository/tag with an
-## image available to your cluster before installing.
+## Published Granary server image (linux/amd64 and linux/arm64).
+## Granary is an unofficial fork derived from MinIO.
+## See docs/maintenance/release.md for the source commit and index digest.
 image:
   repository: docker.io/neil0628/granary
-  tag: unpublished
+  tag: v2026.11.14
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []
 # - name: "image-pull-secret"
 
 ## Separate upstream MinIO client image (`mc`), used by provisioning jobs.
-## This is not the Granary server image.
+## The mc image is unavailable (#33); post-install bucket/user/policy jobs
+## cannot complete with this default. This is not the Granary server image.
 ##
 mcImage:
   repository: quay.io/minio/mc

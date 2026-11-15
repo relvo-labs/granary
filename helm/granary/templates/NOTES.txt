@@ -1,7 +1,9 @@
 Granary is an unofficial fork derived from MinIO, without MinIO endorsement.
-The Granary image is not yet published. The default tag "unpublished" is a
-placeholder. Build this checkout and override image.repository/image.tag with
-an image available to your cluster before installing.
+The default server image is docker.io/neil0628/granary:v2026.11.14,
+published for linux/amd64 and linux/arm64.
+Post-install bucket/user/policy jobs depend on the unavailable quay.io/minio/mc
+image and cannot complete with that default (#33):
+https://github.com/relvo-labs/granary/issues/33
 Self-update is disabled; install replacement Granary images manually.
 
 {{- if eq .Values.service.type "ClusterIP" "NodePort" }}

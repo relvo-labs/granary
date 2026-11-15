@@ -1,11 +1,34 @@
 # Docker Hub image release (#39)
 
 Granary is an unofficial fork derived from MinIO, without upstream endorsement.
-As of 2026-11-14, **no Granary image has been published**. The planned image is
-`docker.io/neil0628/granary`; Helm keeps the `unpublished` placeholder until a
-real release is qualified. Neil's 2026-11-14 decision in #39 replaces the GHCR
-proposal with maintainer-host publishing. Every specific release still needs
-owner go-ahead; the first release also waits for #25 to merge.
+As of 2026-11-15, **`docker.io/neil0628/granary:v2026.11.14` is public** for
+linux/amd64 and linux/arm64, and Helm defaults to that version. Neil's
+2026-11-14 decision in #39 replaces the GHCR proposal with maintainer-host
+publishing. Future releases still need qualification and owner go-ahead.
+Review the [compatibility exceptions](compatibility.md) before adopting a release.
+Helm post-install bucket/user/policy jobs still depend on the unavailable
+`quay.io/minio/mc` image
+([#33](https://github.com/relvo-labs/granary/issues/33)); image publication
+does not make chart provisioning fully working.
+
+## Published releases
+
+Anonymous read-back on **2026-11-15** confirmed the public Docker Hub
+repository and these references for the first image release:
+
+| Field | Value |
+| --- | --- |
+| Version image | `docker.io/neil0628/granary:v2026.11.14` |
+| Alias | `docker.io/neil0628/granary:latest` (same index at read-back) |
+| OCI index digest (both tags) | `sha256:f3eba4c294bb5a445060f6ff7abb7a13e903cb19e7d54c27ad205fd2fa0052e0` |
+| linux/amd64 manifest digest | `sha256:96b485ae28c54501da18c14613b84618cf33361a7b2e6c00815e46833cf1c9d1` |
+| linux/arm64 manifest digest | `sha256:94bf28c58cb074cdc4827f1994b7299fd31a2c82d1b272c98e5b67434d22f961` |
+| Source commit | `6ca7f2eabe5f8b5c83fab537f9d23212a6c81165` (master; includes PR #50 and PR #51) |
+| Binary banner | `granary version RELEASE.2026-11-14T17-23-08Z.v2026.11.14` |
+| Go toolchain | `1.27.4` |
+
+No git tag or GitHub Release was created. Use the version tag and index digest
+for repeatable pulls; `latest` can move with future releases.
 
 ## Prerequisites and source identity
 
@@ -105,7 +128,8 @@ current UTC date as VERSION. It registers
 QEMU on the disposable GitHub runner with a Docker Hub binfmt index pinned by
 digest (read anonymously on 2026-11-14), then calls the same dry-run Make target.
 Docker buildx is supplied by the runner and checked before use. No hosted run
-or completed two-platform build is claimed by this runbook.
+is claimed by this runbook; the published image record above documents the
+maintainer-host result.
 
 ## Publish and read back (owner-authorized maintainer host only)
 
@@ -146,6 +170,6 @@ as private local evidence outside the checkout. If a push or read-back fails,
 stop and inspect both remote tags: publication is not transactional. Preserve
 any version tag that exists; ask the owner to approve recovery of `latest`
 against the verified digest instead of rerunning or replacing a version tag.
-After the first successful release, prepare a separately reviewed docs/Helm
-update replacing the `unpublished` placeholder with the actual version/digest.
+After each successful release, prepare a separately reviewed docs/Helm update
+with the published version/digest and add its source and read-back record above.
 Git tags and release notes, if desired, remain separate owner-authorized work.
