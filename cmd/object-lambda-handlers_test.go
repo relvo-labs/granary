@@ -27,10 +27,12 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/minio/minio-go/v7/pkg/signer"
+	"github.com/minio/mux"
 	"github.com/relvo-labs/granary/internal/auth"
 	"github.com/relvo-labs/granary/internal/config"
 	"github.com/relvo-labs/granary/internal/config/lambda"
@@ -81,6 +83,9 @@ func runObjectLambdaTest(t *testing.T, lambdaStatus int, lambdaBody, contentType
 		t: t,
 		objAPITest: func(obj ObjectLayer, instanceType, bucketName string, apiRouter http.Handler, credentials auth.Credentials, t *testing.T) {
 			objectName := "dummy-object"
+			if _, err := obj.PutObject(t.Context(), bucketName, objectName, mustGetPutObjReader(t, strings.NewReader("data"), 4, "", ""), ObjectOptions{}); err != nil {
+				t.Fatal(err)
+			}
 			functionID := "lambda1"
 			functionToken := "token123"
 
@@ -134,6 +139,7 @@ func runObjectLambdaTest(t *testing.T, lambdaStatus int, lambdaBody, contentType
 
 			body := []byte{}
 			req := httptest.NewRequest("GET", "/objectlambda/"+bucketName+"/"+objectName+"?lambdaArn="+url.QueryEscape(lambdaARN), bytes.NewReader(body))
+			req = mux.SetURLVars(req, map[string]string{"bucket": bucketName, "object": objectName})
 			req.Form = url.Values{"lambdaArn": []string{lambdaARN}}
 			req.Header.Set("Host", "localhost")
 			req.Header.Set("X-Amz-Date", time.Now().UTC().Format("20060102T150405Z"))

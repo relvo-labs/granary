@@ -158,9 +158,24 @@ func (api objectAPIHandlers) GetObjectLambdaHandler(w http.ResponseWriter, r *ht
 	}
 
 	// Check for auth type to return S3 compatible error.
-	cred, _, s3Error := checkRequestAuthTypeCredential(ctx, r, policy.GetObjectAction)
-	if s3Error != ErrNone {
+	if s3Error := authenticateRequest(ctx, r, policy.GetObjectAction); s3Error != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+		return
+	}
+
+	opts, err := getOpts(ctx, r, bucket, object)
+	if err != nil {
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+		return
+	}
+	objInfo, err := objectAPI.GetObjectInfo(ctx, bucket, object, opts)
+	setExistingObjectTags(r.Header, objInfo.UserTags)
+	if s3Error := authorizeRequest(ctx, r, policy.GetObjectAction); s3Error != ErrNone {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+		return
+	}
+	if err != nil {
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
 
@@ -170,7 +185,7 @@ func (api objectAPIHandlers) GetObjectLambdaHandler(w http.ResponseWriter, r *ht
 		return
 	}
 
-	eventData, err := getLambdaEventData(bucket, object, cred, r)
+	eventData, err := getLambdaEventData(bucket, object, logger.GetReqInfo(ctx).Cred, r)
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return

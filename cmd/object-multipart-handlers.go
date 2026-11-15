@@ -306,10 +306,10 @@ func (api objectAPIHandlers) CopyObjectPartHandler(w http.ResponseWriter, r *htt
 		}
 	}
 
-	if s3Error := checkRequestAuthType(ctx, r, policy.GetObjectAction, srcBucket, srcObject); s3Error != ErrNone {
-		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
-		return
-	}
+	// The original headers and destination permissions were checked above.
+	// Source permissions are checked with stored tags in CheckPrecondFn.
+	reqInfo := logger.GetReqInfo(ctx)
+	reqInfo.BucketName, reqInfo.ObjectName = srcBucket, srcObject
 
 	uploadID := r.Form.Get(xhttp.UploadID)
 	partIDString := r.Form.Get(xhttp.PartNumber)
@@ -365,6 +365,14 @@ func (api objectAPIHandlers) CopyObjectPartHandler(w http.ResponseWriter, r *htt
 	checkCopyPartPrecondFn := func(o ObjectInfo) bool {
 		if _, err := DecryptObjectInfo(&o, r); err != nil {
 			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+			return true
+		}
+
+		// Preserve destination RequestObjectTag inputs on the original request.
+		authReq := r.Clone(ctx)
+		setExistingObjectTags(authReq.Header, o.UserTags)
+		if s3Error := authorizeRequest(ctx, authReq, policy.GetObjectAction); s3Error != ErrNone {
+			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 			return true
 		}
 		if checkCopyObjectPartPreconditions(ctx, w, r, o) {

@@ -463,9 +463,9 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 	// Make sure to update context to print ObjectNames for multi objects.
 	ctx = updateReqContext(ctx, objects...)
 
-	// Call checkRequestAuthType to populate ReqInfo.AccessKey before GetBucketInfo()
-	// Ignore errors here to preserve the S3 error behavior of GetBucketInfo()
-	checkRequestAuthType(ctx, r, policy.DeleteObjectAction, bucket, "")
+	// Authenticate the original headers once before any per-object lookup.
+	// Report authentication errors below with the existing multi-delete behavior.
+	authErr := authenticateRequest(ctx, r, policy.DeleteObjectAction)
 
 	deleteObjectsFn := objectAPI.DeleteObjects
 
@@ -499,7 +499,25 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 	vc, _ := globalBucketVersioningSys.Get(bucket)
 	oss := make([]*objSweeper, len(deleteObjectsReq.Objects))
 	for index, object := range deleteObjectsReq.Objects {
-		if apiErrCode := checkRequestAuthTypeWithVID(ctx, r, policy.DeleteObjectAction, bucket, object.ObjectName, object.VersionID); apiErrCode != ErrNone {
+		apiErrCode := authErr
+		if apiErrCode == ErrNone {
+			authInfo, authInfoErr := getObjectInfoFn(ctx, bucket, object.ObjectName, ObjectOptions{VersionID: object.VersionID})
+			authReq := r.Clone(ctx)
+			setExistingObjectTags(authReq.Header, authInfo.UserTags)
+			reqInfo := logger.GetReqInfo(ctx)
+			reqInfo.ObjectName, reqInfo.VersionID = object.ObjectName, object.VersionID
+			if getRequestAuthType(authReq) == authTypeAnonymous {
+				apiErrCode = checkRequestAuthTypeWithVID(ctx, authReq, policy.DeleteObjectAction, bucket, object.ObjectName, object.VersionID)
+			} else {
+				// Signed headers were authenticated before adding stored tags.
+				apiErrCode = authorizeRequest(ctx, authReq, policy.DeleteObjectAction)
+			}
+			if apiErrCode == ErrNone && authInfoErr != nil && !isErrObjectNotFound(authInfoErr) && !isErrVersionNotFound(authInfoErr) &&
+				!isErrBucketNotFound(authInfoErr) && (!authInfo.DeleteMarker || !isErrMethodNotAllowed(authInfoErr)) {
+				apiErrCode = toAPIErrorCode(ctx, authInfoErr)
+			}
+		}
+		if apiErrCode != ErrNone {
 			if apiErrCode == ErrSignatureDoesNotMatch || apiErrCode == ErrInvalidAccessKeyID {
 				writeErrorResponse(ctx, w, errorCodes.ToAPIErr(apiErrCode), r.URL)
 				return
