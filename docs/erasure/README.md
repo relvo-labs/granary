@@ -44,10 +44,10 @@ Example: Start MinIO server in a 12 drives setup, using MinIO binary.
 granary server /data{1...12}
 ```
 
-Example: Start MinIO server in a 8 drives setup, using MinIO Docker image.
-
-Build `granary-local:dev` from this fork with `docker build -t granary-local:dev .`
-first; the Granary image is not yet published.
+Example: Start Granary server in an 8 drives setup, using the published
+`v2026.11.14` image pinned by index digest. Granary is an unofficial fork
+derived from MinIO, without MinIO endorsement. See the
+[release record](../maintenance/release.md#published-releases).
 
 ```sh
 podman run \
@@ -62,7 +62,7 @@ podman run \
   -v /mnt/data6:/data6 \
   -v /mnt/data7:/data7 \
   -v /mnt/data8:/data8 \
-  granary-local:dev server /data{1...8} --console-address ":9001"
+  docker.io/neil0628/granary:v2026.11.14@sha256:f3eba4c294bb5a445060f6ff7abb7a13e903cb19e7d54c27ad205fd2fa0052e0 server /data{1...8} --console-address ":9001"
 ```
 
 ### 3. Test your setup

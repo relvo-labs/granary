@@ -11,12 +11,14 @@ With Compose, you use a Compose file to configure MinIO services. Then, using a 
 
 ## 2. Run Distributed MinIO on Docker Compose
 
-Granary is an unofficial fork derived from MinIO. Its image is not yet published.
-From this fork's repository root, build the local image before using the checked-in
+Granary is an unofficial fork derived from MinIO, without MinIO endorsement.
+The checked-in Compose file uses the public `v2026.11.14` image pinned by
+index digest; see the [release record](../../maintenance/release.md#published-releases).
+From this fork's repository root, pull the image and use the checked-in
 Compose file and nginx configuration:
 
 ```sh
-docker build -t granary-local:dev .
+docker pull docker.io/neil0628/granary:v2026.11.14@sha256:f3eba4c294bb5a445060f6ff7abb7a13e903cb19e7d54c27ad205fd2fa0052e0
 cd docs/orchestration/docker-compose
 ```
 
@@ -52,8 +54,9 @@ Distributed instances are now accessible on the host using the Minio CLI on port
 
 ### Notes
 
-* The Compose file uses your locally built `granary-local:dev` image. Make it
-  available on every node before a Swarm deployment. No Granary image is published yet.
+* The Compose file pins `docker.io/neil0628/granary:v2026.11.14` by index
+  digest for linux/amd64 and linux/arm64. Every Swarm node must be able to pull
+  that public image.
 
 * There are 4 minio distributed instances created by default. You can add more MinIO services (up to total 16) to your MinIO Compose deployment. To add a service
   * Replicate a service definition and change the name of the new service appropriately.

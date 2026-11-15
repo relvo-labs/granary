@@ -173,12 +173,16 @@ comment. The digests were read on 2026-11-14 with anonymous
 | `golang:1.27.4-bookworm` | `sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea` |
 | `debian:bookworm-slim` | `sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc` |
 
-`ci-helm-lint` uses `helm/granary`; its server image tag `unpublished` is a
-placeholder because the Docker Hub `docker.io/neil0628/granary` image is not
-yet published. The [release runbook](release.md) describes host-local
-publishing and the manual dry-run workflow; neither has publication authority.
-Provisioning jobs retain the separate upstream `mc` client image. Self-update and upstream update
-notifications are disabled; install replacement Granary builds manually.
+`ci-helm-lint` uses `helm/granary`; its server image tag is `v2026.11.14`
+from the public Docker Hub `docker.io/neil0628/granary` repository. See the
+[published release record](release.md#published-releases) for digests and source
+identity. The [release runbook](release.md) describes host-local publishing
+and the manual dry-run workflow; neither has publication authority.
+Post-install bucket/user/policy jobs retain the separate upstream
+`quay.io/minio/mc` client image, which is unavailable
+([#33](https://github.com/relvo-labs/granary/issues/33)); passing lint does not
+qualify chart provisioning. Self-update and upstream update notifications are
+disabled; install replacement Granary builds manually.
 
 The single root Dockerfile replaces `Dockerfile.release`,
 `Dockerfile.release.old_cpu`, `Dockerfile.hotfix`, `Dockerfile.cicd` and

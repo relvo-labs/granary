@@ -9,7 +9,8 @@ Granary is an S3-compatible object store. It inherits the upstream MinIO server
 source for storing objects in buckets and accessing them through S3 clients.
 The rename ([#21](https://github.com/relvo-labs/granary/issues/21)) uses the
 `granary` binary and `github.com/relvo-labs/granary` Go module path. Inherited
-`MINIO_*` environment variables and S3 behavior remain compatible.
+`MINIO_*` environment variables and S3 behavior remain compatible, with the
+[documented exceptions](docs/maintenance/compatibility.md).
 The upstream [minio/minio](https://github.com/minio/minio) repository is archived.
 This fork focuses on source maintenance, dependency security, CI and source
 compatibility. It offers no newly certified feature set, performance guarantee
@@ -22,11 +23,12 @@ migrations or recovery. See the [CI runbook](docs/maintenance/ci.md) for gates
 and known boundaries, including the [stringer coverage gap (#13)](https://github.com/relvo-labs/granary/issues/13),
 manual heavy integrations and pending hosted evidence.
 
-As of **2026-11-14**, this fork has no GitHub releases. Planned releases will use
-`vYYYY.MM.DD` tags and `docker.io/neil0628/granary` images; none are published
-yet. Upstream `minio/minio` releases and images are not Granary releases. Build
-the checked-out fork source to evaluate it locally. The maintainer-host image
-script and manual dry-run workflow are described in the [release runbook](docs/maintenance/release.md).
+As of **2026-11-15**, `docker.io/neil0628/granary:v2026.11.14` is public for
+linux/amd64 and linux/arm64; `:latest` points to the same image index. No git
+tag or GitHub Release was created. See the [published release record](docs/maintenance/release.md#published-releases)
+for the source commit, digests and binary version. Upstream `minio/minio`
+releases and images are not Granary releases. The maintainer-host image script
+and manual dry-run workflow are described in the [release runbook](docs/maintenance/release.md).
 
 [Build and try locally](#build-and-try-locally) ·
 [Find your next step](#find-your-next-step) ·
@@ -166,19 +168,19 @@ you can remove the disposable checkout separately after finishing evaluation.
 ## Inherited references
 
 The root [Dockerfile](Dockerfile) builds `granary` from this checkout with Go
-1.27.4. Build and try a local image with:
+1.27.4. To inspect the published release, use its version tag and index digest:
 
 ```sh
-docker build -t granary-local:dev .
-docker run --rm granary-local:dev --version
+docker pull docker.io/neil0628/granary:v2026.11.14@sha256:f3eba4c294bb5a445060f6ff7abb7a13e903cb19e7d54c27ad205fd2fa0052e0
+docker run --rm docker.io/neil0628/granary:v2026.11.14@sha256:f3eba4c294bb5a445060f6ff7abb7a13e903cb19e7d54c27ad205fd2fa0052e0 --version
 ```
 
 The [Helm chart](helm/granary) defaults to
-`docker.io/neil0628/granary:unpublished`. **The Granary image is not yet
-published**; override the placeholder with an image you built and made
-available to your cluster. No binary or image release is advertised yet.
-Self-update and background update checks are disabled; install a Granary
-release manually when one is available, or rebuild from the selected source.
+`docker.io/neil0628/granary:v2026.11.14`. Its post-install bucket/user/policy
+jobs still depend on the unavailable `quay.io/minio/mc` image
+([#33](https://github.com/relvo-labs/granary/issues/33)); chart provisioning is
+not fully working. Self-update and background update checks are disabled;
+install replacement Granary releases manually, or rebuild from the selected source.
 No `minio` compatibility executable is installed.
 
 The [docs tree](docs) still contains inherited upstream guidance. Historical

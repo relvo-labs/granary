@@ -3,17 +3,18 @@
 Granary is an unofficial fork derived from MinIO, without affiliation with or
 endorsement by MinIO, Inc. Upstream copyright and license notices are retained.
 
-**The Granary image is not yet published.** The default
-`docker.io/neil0628/granary:unpublished` is a placeholder, not an available
-release. Build the root Dockerfile, make that image available to your cluster,
-and override `image.repository` and `image.tag` before installing. For example,
-with a locally loaded `granary-local:phase3` image:
+The default server image is the public
+`docker.io/neil0628/granary:v2026.11.14` for linux/amd64 and linux/arm64.
+Chart version `0.1.1` uses appVersion `v2026.11.14`; see the
+[published release record](../../docs/maintenance/release.md#published-releases)
+for the source commit, index digest and binary banner.
 
-```sh
-helm install granary ./helm/granary --set image.repository=granary-local,image.tag=phase3
-```
-
-Provisioning jobs use the separate upstream `quay.io/minio/mc` client image.
+**Post-install provisioning remains blocked:** bucket/user/policy jobs depend
+on the separate upstream `quay.io/minio/mc` client image, which is unavailable
+([#33](https://github.com/relvo-labs/granary/issues/33)). These jobs cannot
+complete with the default client image, including the default user-creation
+job. The install and provisioning examples below remain subject to this
+limitation; this chart is not fully working.
 Server self-update is disabled; install replacement Granary images manually.
 The helper names and `minio*` values are retained to limit configuration churn.
 This renamed chart is not a qualified in-place migration of existing releases;
@@ -38,7 +39,8 @@ Install this chart using:
 helm install --namespace minio --set rootUser=rootuser,rootPassword=rootpass123 --generate-name ./helm/granary
 ```
 
-The command deploys Granary on the Kubernetes cluster in the default configuration. The [configuration](#configuration) section lists the parameters that can be configured during installation.
+The command requests the default Granary deployment; post-install provisioning
+is blocked by the unavailable `mc` image described above. The [configuration](#configuration) section lists the parameters that can be configured during installation.
 
 ### Installing the Chart (toy-setup)
 
