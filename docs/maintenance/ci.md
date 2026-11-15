@@ -49,6 +49,13 @@ Go: every job uses `actions/setup-go` with `go-version-file: go.mod`, which
 selects the `toolchain go1.27.4` directive, and `make ci-go-version` fails if the
 active Go differs.
 
+The root `go 1.26.0` directive declares **language compatibility**, not the
+minimum patched compiler. For GO-2026-6859, local Make build entries and
+`buildscripts/checkdeps.sh` require a stable compiler from Go 1.26.11 onward
+on the 1.26 line, Go 1.27.4 onward on the 1.27 line, or a newer minor version.
+Older, unrecognized, prerelease and development compilers fail before
+compilation. CI still requires the exact `toolchain` pin from `go.mod`.
+
 Actions are pinned to the commit of a release tag. The SHAs come from
 `git ls-remote --tags` of each canonical repository; the tags are each
 repository's latest GitHub release.
@@ -138,7 +145,15 @@ run them only on a disposable runner or with a scratch `GOPATH`.
 
 The root module and linker symbol prefix are `github.com/relvo-labs/granary`.
 Independent modules under `docs/debugging` retain their inherited module paths
-and Go pins because they do not import the root module (#27).
+and language versions; their toolchain directives follow the root module's
+`go1.27.4` pin (#27). Their dependencies are unchanged. The helper build loop
+stops at the first failed build and returns its exit status (#14).
+
+`make build`, `make install-race` and `make docker` require successful linker
+flag generation and nonempty `Version`, `CommitID` and `ReleaseTag` assignments
+before compiling anything, including debugging helpers under `make -j` (#38).
+Invalid `MINIO_RELEASE`/`MINIO_HOTFIX` values therefore fail the build. Flags
+are generated once on demand, so unrelated Make targets need no version stamp.
 
 `ci-build` produces `./granary` and then fails unless the `(commit-id=...)`
 field of `./granary --version` is exactly the full `git rev-parse HEAD` commit
