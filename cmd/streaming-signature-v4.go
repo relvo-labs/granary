@@ -454,6 +454,7 @@ func (cr *s3ChunkedReader) readTrailers() error {
 			if err == io.EOF {
 				return io.ErrUnexpectedEOF
 			}
+			return err
 		}
 		if v != '\r' {
 			valueBuffer.WriteByte(v)
@@ -465,6 +466,7 @@ func (cr *s3ChunkedReader) readTrailers() error {
 			if err == io.EOF {
 				return io.ErrUnexpectedEOF
 			}
+			return err
 		}
 		if v != '\n' {
 			return errMalformedEncoding
@@ -480,6 +482,7 @@ func (cr *s3ChunkedReader) readTrailers() error {
 			if err == io.EOF {
 				return io.ErrUnexpectedEOF
 			}
+			return err
 		}
 		if v != '\r' {
 			signatureBuffer.WriteByte(v)
@@ -491,6 +494,7 @@ func (cr *s3ChunkedReader) readTrailers() error {
 			if err == io.EOF {
 				return io.ErrUnexpectedEOF
 			}
+			return err
 		}
 		if string(tmp[:]) != "\n\r\n" {
 			if cr.debug {
