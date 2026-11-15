@@ -3253,7 +3253,10 @@ func (api objectAPIHandlers) PutObjectTaggingHandler(w http.ResponseWriter, r *h
 				perr := proxyTaggingToRepTarget(ctx, bucket, object, tags, opts, proxytgts)
 				if perr.Err != nil {
 					globalReplicationStats.Load().incProxy(bucket, putObjectTaggingAPI, true)
-					writeErrorResponse(ctx, w, toAPIError(ctx, perr.Err), r.URL)
+					if !errors.Is(perr.Err, errProxyNoRemoteResult) {
+						err = perr.Err
+					}
+					writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 					return
 				}
 				w.Header()[xhttp.MinIOTaggingProxied] = []string{"true"}
@@ -3371,7 +3374,10 @@ func (api objectAPIHandlers) DeleteObjectTaggingHandler(w http.ResponseWriter, r
 				perr = proxyTaggingToRepTarget(ctx, bucket, object, nil, opts, proxytgts)
 				if perr.Err != nil {
 					globalReplicationStats.Load().incProxy(bucket, removeObjectTaggingAPI, true)
-					writeErrorResponse(ctx, w, toAPIError(ctx, perr.Err), r.URL)
+					if !errors.Is(perr.Err, errProxyNoRemoteResult) {
+						err = perr.Err
+					}
+					writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 					return
 				}
 				// when delete tagging is proxied, the object version/tags are not available to return

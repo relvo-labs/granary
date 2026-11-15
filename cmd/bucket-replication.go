@@ -2654,6 +2654,11 @@ func proxyGetTaggingToRepTarget(ctx context.Context, bucket, object string, opts
 			return nil, proxyResult{Err: err}
 		}
 		if responded[idx] {
+			// These tags authorize a mutation on every eligible target.
+			// Conflicting policy inputs cannot safely authorize that fan-out.
+			if proxy.Proxy && !maps.Equal(tgs.ToMap(), tagSlc[idx].ToMap()) {
+				return nil, proxyResult{Err: PrefixAccessDenied{Bucket: bucket, Object: object}}
+			}
 			tgs = tagSlc[idx]
 			proxy.Proxy = true
 		}
