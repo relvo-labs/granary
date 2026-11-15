@@ -2328,9 +2328,17 @@ func initBackgroundReplication(ctx context.Context, objectAPI ObjectLayer) {
 // object with an empty tag set. Callers must not authorize using missing results.
 var errProxyNoRemoteResult = errors.New("replication proxy: no remote result")
 
+// proxyTaggingTarget pins the client and bucket used by a successful tag read.
+// A later target configuration change must not redirect the authorized deletion.
+type proxyTaggingTarget struct {
+	client *minio.Client
+	bucket string
+}
+
 type proxyResult struct {
-	Proxy bool
-	Err   error
+	Proxy          bool
+	Err            error
+	taggingTargets []proxyTaggingTarget
 }
 
 // get Reader from replication target if active-active replication is in place and
@@ -2607,6 +2615,45 @@ func proxyTaggingToRepTarget(ctx context.Context, bucket, object string, tags *t
 	return proxy
 }
 
+// proxyDeleteTaggingToRepTarget deletes only from the successful, agreeing tag
+// responders captured before authorization. Unread and not-found targets have no
+// entry in this snapshot, even if they become available before the mutation.
+func proxyDeleteTaggingToRepTarget(ctx context.Context, object string, opts ObjectOptions, targets []proxyTaggingTarget) (proxy proxyResult) {
+	if opts.ProxyRequest || (opts.ProxyHeaderSet && !opts.ProxyRequest) {
+		return proxyResult{Err: errProxyNoRemoteResult}
+	}
+	var wg sync.WaitGroup
+	errs := make([]error, len(targets))
+	for idx, tgt := range targets {
+		errs[idx] = errProxyNoRemoteResult
+		if globalBucketTargetSys.isOffline(tgt.client.EndpointURL()) {
+			continue
+		}
+		wg.Add(1)
+		go func(idx int, tgt proxyTaggingTarget) {
+			defer wg.Done()
+			errs[idx] = tgt.client.RemoveObjectTagging(ctx, tgt.bucket, object, minio.RemoveObjectTaggingOptions{
+				VersionID: opts.VersionID,
+				Internal: minio.AdvancedObjectTaggingOptions{
+					ReplicationProxyRequest: "true",
+				},
+			})
+		}(idx, tgt)
+	}
+	wg.Wait()
+
+	terr := errProxyNoRemoteResult
+	for _, err := range errs {
+		if err == nil {
+			return proxyResult{Proxy: true}
+		}
+		if !errors.Is(err, errProxyNoRemoteResult) {
+			terr = err
+		}
+	}
+	return proxyResult{Err: terr}
+}
+
 // proxyGetTaggingToRepTarget proxies get tagging requests to remote targets for
 // active-active replicated setups
 func proxyGetTaggingToRepTarget(ctx context.Context, bucket, object string, opts ObjectOptions, proxyTargets *madmin.BucketTargets) (tgs *tags.Tags, proxy proxyResult) {
@@ -2619,6 +2666,7 @@ func proxyGetTaggingToRepTarget(ctx context.Context, bucket, object string, opts
 	errs := make([]error, len(proxyTargets.Targets))
 	responded := make([]bool, len(proxyTargets.Targets))
 	tagSlc := make([]*tags.Tags, len(proxyTargets.Targets))
+	targetSlc := make([]proxyTaggingTarget, len(proxyTargets.Targets))
 	for idx, t := range proxyTargets.Targets {
 		tgt := globalBucketTargetSys.GetRemoteTargetClient(bucket, t.Arn)
 		if tgt == nil || globalBucketTargetSys.isOffline(tgt.EndpointURL()) {
@@ -2628,9 +2676,9 @@ func proxyGetTaggingToRepTarget(ctx context.Context, bucket, object string, opts
 		if tgt.disableProxy {
 			continue
 		}
-		idx := idx
+		snapshot := proxyTaggingTarget{client: tgt.Client, bucket: tgt.Bucket}
 		wg.Add(1)
-		go func(idx int, tgt *TargetClient) {
+		go func(idx int, tgt proxyTaggingTarget) {
 			defer wg.Done()
 			gopts := minio.GetObjectTaggingOptions{
 				VersionID: opts.VersionID,
@@ -2638,14 +2686,15 @@ func proxyGetTaggingToRepTarget(ctx context.Context, bucket, object string, opts
 					ReplicationProxyRequest: "true",
 				},
 			}
-			tgs, err := tgt.GetObjectTagging(ctx, tgt.Bucket, object, gopts)
+			tgs, err := tgt.client.GetObjectTagging(ctx, tgt.bucket, object, gopts)
 			if err != nil {
 				errs[idx] = err
 			} else {
 				tagSlc[idx] = tgs
+				targetSlc[idx] = tgt
 				responded[idx] = true
 			}
-		}(idx, tgt)
+		}(idx, snapshot)
 	}
 	wg.Wait()
 	for idx, err := range errs {
@@ -2654,13 +2703,15 @@ func proxyGetTaggingToRepTarget(ctx context.Context, bucket, object string, opts
 			return nil, proxyResult{Err: err}
 		}
 		if responded[idx] {
-			// These tags authorize a mutation on every eligible target.
-			// Conflicting policy inputs cannot safely authorize that fan-out.
+			// Only successful responders participate in authorization and deletion.
+			// Not-found responses have no object version to mutate.
+			// All successful responders must agree on the policy inputs.
 			if proxy.Proxy && !maps.Equal(tgs.ToMap(), tagSlc[idx].ToMap()) {
 				return nil, proxyResult{Err: PrefixAccessDenied{Bucket: bucket, Object: object}}
 			}
 			tgs = tagSlc[idx]
 			proxy.Proxy = true
+			proxy.taggingTargets = append(proxy.taggingTargets, targetSlc[idx])
 		}
 	}
 	if len(errs) == 1 {

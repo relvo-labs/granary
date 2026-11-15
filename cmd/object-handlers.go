@@ -3371,7 +3371,7 @@ func (api objectAPIHandlers) DeleteObjectTaggingHandler(w http.ResponseWriter, r
 					return
 				}
 				// proxy to replication target if active-active replication is in place.
-				perr = proxyTaggingToRepTarget(ctx, bucket, object, nil, opts, proxytgts)
+				perr = proxyDeleteTaggingToRepTarget(ctx, object, opts, perr.taggingTargets)
 				if perr.Err != nil {
 					globalReplicationStats.Load().incProxy(bucket, removeObjectTaggingAPI, true)
 					if !errors.Is(perr.Err, errProxyNoRemoteResult) {
