@@ -2324,6 +2324,10 @@ func initBackgroundReplication(ctx context.Context, objectAPI ObjectLayer) {
 	go stats.trackEWMA()
 }
 
+// errProxyNoRemoteResult distinguishes unavailable proxy targets from a remote
+// object with an empty tag set. Callers must not authorize using missing results.
+var errProxyNoRemoteResult = errors.New("replication proxy: no remote result")
+
 type proxyResult struct {
 	Proxy bool
 	Err   error
@@ -2537,10 +2541,11 @@ func proxyTaggingToRepTarget(ctx context.Context, bucket, object string, tags *t
 	// this option is set when active-active replication is in place between site A -> B,
 	// and request hits site B that does not have the object yet.
 	if opts.ProxyRequest || (opts.ProxyHeaderSet && !opts.ProxyRequest) { // true only when site B sets MinIOSourceProxyRequest header
-		return proxy
+		return proxyResult{Err: errProxyNoRemoteResult}
 	}
 	var wg sync.WaitGroup
 	errs := make([]error, len(proxyTargets.Targets))
+	responded := make([]bool, len(proxyTargets.Targets))
 	for idx, t := range proxyTargets.Targets {
 		tgt := globalBucketTargetSys.GetRemoteTargetClient(bucket, t.Arn)
 		if tgt == nil || globalBucketTargetSys.isOffline(tgt.EndpointURL()) {
@@ -2572,9 +2577,8 @@ func proxyTaggingToRepTarget(ctx context.Context, bucket, object string, tags *t
 				}
 				err = tgt.RemoveObjectTagging(ctx, tgt.Bucket, object, dopts)
 			}
-			if err != nil {
-				errs[idx] = err
-			}
+			errs[idx] = err
+			responded[idx] = err == nil
 		}(idx, tgt)
 	}
 	wg.Wait()
@@ -2583,8 +2587,8 @@ func proxyTaggingToRepTarget(ctx context.Context, bucket, object string, tags *t
 		terr        error
 		taggedCount int
 	)
-	for _, err := range errs {
-		if err == nil {
+	for idx, err := range errs {
+		if responded[idx] {
 			taggedCount++
 			continue
 		}
@@ -2593,9 +2597,13 @@ func proxyTaggingToRepTarget(ctx context.Context, bucket, object string, tags *t
 		}
 	}
 	// don't return error if at least one target was tagged successfully
-	if taggedCount == 0 && terr != nil {
+	if taggedCount == 0 {
+		if terr == nil {
+			terr = errProxyNoRemoteResult
+		}
 		proxy.Err = terr
 	}
+	proxy.Proxy = taggedCount > 0
 	return proxy
 }
 
@@ -2605,11 +2613,12 @@ func proxyGetTaggingToRepTarget(ctx context.Context, bucket, object string, opts
 	// this option is set when active-active replication is in place between site A -> B,
 	// and request hits site B that does not have the object yet.
 	if opts.ProxyRequest || (opts.ProxyHeaderSet && !opts.ProxyRequest) { // true only when site B sets MinIOSourceProxyRequest header
-		return nil, proxy
+		return nil, proxyResult{Err: errProxyNoRemoteResult}
 	}
 	var wg sync.WaitGroup
 	errs := make([]error, len(proxyTargets.Targets))
-	tagSlc := make([]map[string]string, len(proxyTargets.Targets))
+	responded := make([]bool, len(proxyTargets.Targets))
+	tagSlc := make([]*tags.Tags, len(proxyTargets.Targets))
 	for idx, t := range proxyTargets.Targets {
 		tgt := globalBucketTargetSys.GetRemoteTargetClient(bucket, t.Arn)
 		if tgt == nil || globalBucketTargetSys.isOffline(tgt.EndpointURL()) {
@@ -2623,18 +2632,18 @@ func proxyGetTaggingToRepTarget(ctx context.Context, bucket, object string, opts
 		wg.Add(1)
 		go func(idx int, tgt *TargetClient) {
 			defer wg.Done()
-			var err error
 			gopts := minio.GetObjectTaggingOptions{
 				VersionID: opts.VersionID,
 				Internal: minio.AdvancedObjectTaggingOptions{
 					ReplicationProxyRequest: "true",
 				},
 			}
-			tgs, err = tgt.GetObjectTagging(ctx, tgt.Bucket, object, gopts)
+			tgs, err := tgt.GetObjectTagging(ctx, tgt.Bucket, object, gopts)
 			if err != nil {
 				errs[idx] = err
 			} else {
-				tagSlc[idx] = tgs.ToMap()
+				tagSlc[idx] = tgs
+				responded[idx] = true
 			}
 		}(idx, tgt)
 	}
@@ -2644,12 +2653,16 @@ func proxyGetTaggingToRepTarget(ctx context.Context, bucket, object string, opts
 		if err != nil && errCode != "NoSuchKey" && errCode != "NoSuchVersion" {
 			return nil, proxyResult{Err: err}
 		}
-		if err == nil {
-			tgs, _ = tags.MapToObjectTags(tagSlc[idx])
+		if responded[idx] {
+			tgs = tagSlc[idx]
+			proxy.Proxy = true
 		}
 	}
 	if len(errs) == 1 {
 		proxy.Err = errs[0]
+	}
+	if !proxy.Proxy && proxy.Err == nil {
+		proxy.Err = errProxyNoRemoteResult
 	}
 	return tgs, proxy
 }
