@@ -97,15 +97,33 @@ func setHeadGetRespHeaders(w http.ResponseWriter, reqParams url.Values) {
 	}
 }
 
-// setExistingObjectTags replaces client request tags with stored tags for read/delete
-// authorization. Call only after authenticating the original headers; upload
-// authorization must retain its RequestObjectTag inputs.
-func setExistingObjectTags(h http.Header, userTags string) {
-	if userTags == "" {
-		h.Del(xhttp.AmzObjectTagging)
-		return
+// loadExistingObjectTags selects stored policy inputs without changing request
+// headers. Unavailable objects contribute no tags; callers authorize before
+// returning other lookup errors.
+func loadExistingObjectTags(ctx context.Context, r *http.Request, objectAPI ObjectLayer, bucket, object string) error {
+	setExistingObjectTags(r, "")
+	opts, err := getOpts(ctx, r, bucket, object)
+	if err != nil {
+		return err
 	}
-	h.Set(xhttp.AmzObjectTagging, userTags)
+	setExistingObjectTagsForVersion(r, "", opts.VersionID)
+	info, err := objectAPI.GetObjectInfo(ctx, bucket, object, opts)
+	if err == nil {
+		setExistingObjectTagsForVersion(r, info.UserTags, opts.VersionID)
+		return nil
+	}
+	if isErrObjectNotFound(err) || isErrVersionNotFound(err) || (info.DeleteMarker && isErrMethodNotAllowed(err)) {
+		return nil
+	}
+	return err
+}
+
+func authorizeObjectTagRequest(ctx context.Context, r *http.Request, objectAPI ObjectLayer, action policy.Action, bucket, object string) APIErrorCode {
+	tagErr := loadExistingObjectTags(ctx, r, objectAPI, bucket, object)
+	if s3Error := authorizeRequest(ctx, r, action); s3Error != ErrNone {
+		return s3Error
+	}
+	return toAPIErrorCode(ctx, tagErr)
 }
 
 // SelectObjectContentHandler - GET Object?select
@@ -207,7 +225,7 @@ func (api objectAPIHandlers) SelectObjectContentHandler(w http.ResponseWriter, r
 	gopts := opts
 	gopts.NoLock = true // We already have a lock, we can live with it.
 	objInfo, err := getObjectInfo(ctx, bucket, object, gopts)
-	setExistingObjectTags(r.Header, objInfo.UserTags)
+	setExistingObjectTags(r, objInfo.UserTags)
 	if s3Error := authorizeRequest(ctx, r, policy.GetObjectAction); s3Error != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 		return
@@ -373,7 +391,7 @@ func (api objectAPIHandlers) getObjectHandler(ctx context.Context, objectAPI Obj
 		return
 	}
 
-	setExistingObjectTags(r.Header, "")
+	setExistingObjectTags(r, "")
 	getObjectNInfo := objectAPI.GetObjectNInfo
 
 	// Get request range.
@@ -404,7 +422,7 @@ func (api objectAPIHandlers) getObjectHandler(ctx context.Context, objectAPI Obj
 			return true
 		}
 
-		setExistingObjectTags(r.Header, oi.UserTags)
+		setExistingObjectTags(r, oi.UserTags)
 
 		if s3Error := authorizeRequest(ctx, r, policy.GetObjectAction); s3Error != ErrNone {
 			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
@@ -609,7 +627,7 @@ func (api objectAPIHandlers) getObjectAttributesHandler(ctx context.Context, obj
 	}
 
 	objInfo, err := objectAPI.GetObjectInfo(ctx, bucket, object, opts)
-	setExistingObjectTags(r.Header, objInfo.UserTags)
+	setExistingObjectTags(r, objInfo.UserTags)
 	for _, action := range []policy.Action{attributesAction, getAction} {
 		if s3Error := authorizeRequest(ctx, r, action); s3Error != ErrNone {
 			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
@@ -852,7 +870,7 @@ func (api objectAPIHandlers) headObjectHandler(ctx context.Context, objectAPI Ob
 		}
 	}
 
-	setExistingObjectTags(r.Header, objInfo.UserTags)
+	setExistingObjectTags(r, objInfo.UserTags)
 
 	if s3Error := authorizeRequest(ctx, r, policy.GetObjectAction); s3Error != ErrNone {
 		writeErrorResponseHeadersOnly(w, errorCodes.ToAPIErr(s3Error))
@@ -1183,7 +1201,14 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	if s3Error := checkRequestAuthType(ctx, r, policy.PutObjectAction, dstBucket, dstObject); s3Error != ErrNone {
+	if s3Error := authenticateRequest(ctx, r, policy.PutObjectAction); s3Error != ErrNone {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+		return
+	}
+	if isDirectiveReplace(r.Header.Get(xhttp.AmzTagDirective)) {
+		setRequestObjectTags(r, r.Header.Get(xhttp.AmzObjectTagging))
+	}
+	if s3Error := authorizeObjectTagRequest(ctx, r, objectAPI, policy.PutObjectAction, dstBucket, dstObject); s3Error != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 		return
 	}
@@ -1222,7 +1247,7 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 	// The original headers and destination permissions were checked above.
 	// Source permissions are checked with stored tags in CheckPrecondFn.
 	reqInfo := logger.GetReqInfo(ctx)
-	reqInfo.BucketName, reqInfo.ObjectName = srcBucket, srcObject
+	reqInfo.BucketName, reqInfo.ObjectName, reqInfo.VersionID = srcBucket, srcObject, vid
 
 	// Check if metadata directive is valid.
 	if !isDirectiveValid(r.Header.Get(xhttp.AmzMetadataDirective)) {
@@ -1278,19 +1303,22 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 
 	getObjectNInfo := objectAPI.GetObjectNInfo
 
+	sourceAuthChecked := false
 	checkCopyPrecondFn := func(o ObjectInfo) bool {
+		sourceAuthChecked = true
+		// Preserve destination RequestObjectTag inputs on the original request.
+		authReq := r.Clone(r.Context())
+		setRequestObjectTags(authReq, "")
+		setExistingObjectTagsForVersion(authReq, o.UserTags, srcOpts.VersionID)
+		if s3Error := authorizeRequest(ctx, authReq, policy.GetObjectAction); s3Error != ErrNone {
+			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+			return true
+		}
 		if _, err := DecryptObjectInfo(&o, r); err != nil {
 			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 			return true
 		}
 
-		// Preserve destination RequestObjectTag inputs on the original request.
-		authReq := r.Clone(ctx)
-		setExistingObjectTags(authReq.Header, o.UserTags)
-		if s3Error := authorizeRequest(ctx, authReq, policy.GetObjectAction); s3Error != ErrNone {
-			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
-			return true
-		}
 		return checkCopyObjectPreconditions(ctx, w, r, o)
 	}
 	getOpts.CheckPrecondFn = checkCopyPrecondFn
@@ -1301,6 +1329,22 @@ func (api objectAPIHandlers) CopyObjectHandler(w http.ResponseWriter, r *http.Re
 	var rs *HTTPRangeSpec
 	gr, err := getObjectNInfo(ctx, srcBucket, srcObject, rs, r.Header, getOpts)
 	if err != nil {
+		if !sourceAuthChecked {
+			authReq := r.Clone(r.Context())
+			setRequestObjectTags(authReq, "")
+			setExistingObjectTagsForVersion(authReq, "", srcOpts.VersionID)
+			// Some data/range errors bypass the callback even when metadata
+			// is available. Use that version's tags before exposing the error.
+			authOpts := getOpts
+			authOpts.CheckPrecondFn = nil
+			if info, infoErr := objectAPI.GetObjectInfo(ctx, srcBucket, srcObject, authOpts); infoErr == nil {
+				setExistingObjectTagsForVersion(authReq, info.UserTags, srcOpts.VersionID)
+			}
+			if s3Error := authorizeRequest(ctx, authReq, policy.GetObjectAction); s3Error != ErrNone {
+				writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+				return
+			}
+		}
 		if isErrPreconditionFailed(err) {
 			return
 		}
@@ -1898,12 +1942,6 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 		putObject = objectAPI.PutObject
 	)
 
-	// Check if put is allowed
-	if s3Err = isPutActionAllowed(ctx, rAuthType, bucket, object, r, policy.PutObjectAction); s3Err != ErrNone {
-		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Err), r.URL)
-		return
-	}
-
 	switch rAuthType {
 	case authTypeStreamingSigned, authTypeStreamingSignedTrailer:
 		// Initialize stream signature verifier.
@@ -1934,6 +1972,19 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 		if !skipContentSha256Cksum(r) {
 			sha256hex = getContentSha256Cksum(r, serviceS3)
 		}
+	}
+
+	setRequestObjectTags(r, r.Header.Get(xhttp.AmzObjectTagging))
+	tagErr := loadExistingObjectTags(ctx, r, objectAPI, bucket, object)
+	// Check if put is allowed
+	if s3Err = isPutActionAllowed(ctx, rAuthType, bucket, object, r, policy.PutObjectAction); s3Err != ErrNone {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Err), r.URL)
+		return
+	}
+
+	if tagErr != nil {
+		writeErrorResponse(ctx, w, toAPIError(ctx, tagErr), r.URL)
+		return
 	}
 
 	if _, ok := r.Header[xhttp.MinIOSourceReplicationCheck]; ok {
@@ -2230,8 +2281,7 @@ func (api objectAPIHandlers) PutObjectExtractHandler(w http.ResponseWriter, r *h
 
 	vars := mux.Vars(r)
 	bucket := vars["bucket"]
-	object, err := unescapePath(vars["object"])
-	if err != nil {
+	if _, err := unescapePath(vars["object"]); err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
 	}
@@ -2359,9 +2409,6 @@ func (api objectAPIHandlers) PutObjectExtractHandler(w http.ResponseWriter, r *h
 		AutoEncrypt: globalAutoEncryption,
 	})
 
-	retPerms := isPutActionAllowed(ctx, getRequestAuthType(r), bucket, object, r, policy.PutObjectRetentionAction)
-	holdPerms := isPutActionAllowed(ctx, getRequestAuthType(r), bucket, object, r, policy.PutObjectLegalHoldAction)
-
 	getObjectInfo := objectAPI.GetObjectInfo
 
 	// These are static for all objects extracted.
@@ -2376,10 +2423,6 @@ func (api objectAPIHandlers) PutObjectExtractHandler(w http.ResponseWriter, r *h
 
 	putObjectTar := func(reader io.Reader, info os.FileInfo, object string) error {
 		size := info.Size()
-		if s3Err = isPutActionAllowed(ctx, getRequestAuthType(r), bucket, object, r, policy.PutObjectAction); s3Err != ErrNone {
-			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Err), r.URL)
-			return errors.New(errorCodes.ToAPIErr(s3Err).Code)
-		}
 		metadata := map[string]string{
 			xhttp.AmzStorageClass: sc, // save same storage-class as incoming stream.
 		}
@@ -2413,14 +2456,6 @@ func (api objectAPIHandlers) PutObjectExtractHandler(w http.ResponseWriter, r *h
 		rawReader := hashReader
 		pReader := NewPutObjReader(rawReader)
 
-		if r.Header.Get(xhttp.AmzBucketReplicationStatus) == replication.Replica.String() {
-			if s3Err = isPutActionAllowed(ctx, getRequestAuthType(r), bucket, object, r, policy.ReplicateObjectAction); s3Err != ErrNone {
-				return errors.New(errorCodes.ToAPIErr(s3Err).Code)
-			}
-			metadata[ReservedMetadataPrefixLower+ReplicaStatus] = replication.Replica.String()
-			metadata[ReservedMetadataPrefixLower+ReplicaTimestamp] = UTCNow().Format(time.RFC3339Nano)
-		}
-
 		var (
 			versionID string
 			hdrs      http.Header
@@ -2453,13 +2488,38 @@ func (api objectAPIHandlers) PutObjectExtractHandler(w http.ResponseWriter, r *h
 			return err
 		}
 
+		authReq := r.Clone(r.Context())
+		setExistingObjectTagsForVersion(authReq, "", versionID)
+		existing, tagErr := getObjectInfo(ctx, bucket, object, ObjectOptions{VersionID: versionID})
+		if tagErr == nil {
+			setExistingObjectTagsForVersion(authReq, existing.UserTags, versionID)
+		}
+		if s3Err = isPutActionAllowed(ctx, getRequestAuthType(r), bucket, object, authReq, policy.PutObjectAction); s3Err != ErrNone {
+			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Err), r.URL)
+			return errors.New(errorCodes.ToAPIErr(s3Err).Code)
+		}
+		if r.Header.Get(xhttp.AmzBucketReplicationStatus) == replication.Replica.String() {
+			if s3Err = isPutActionAllowed(ctx, getRequestAuthType(r), bucket, object, authReq, policy.ReplicateObjectAction); s3Err != ErrNone {
+				return errors.New(errorCodes.ToAPIErr(s3Err).Code)
+			}
+			metadata[ReservedMetadataPrefixLower+ReplicaStatus] = replication.Replica.String()
+			metadata[ReservedMetadataPrefixLower+ReplicaTimestamp] = UTCNow().Format(time.RFC3339Nano)
+		}
+
+		if tagErr != nil && !isErrObjectNotFound(tagErr) && !isErrVersionNotFound(tagErr) &&
+			(!existing.DeleteMarker || !isErrMethodNotAllowed(tagErr)) {
+			return tagErr
+		}
+		retPerms := isPutActionAllowed(ctx, getRequestAuthType(authReq), bucket, object, authReq, policy.PutObjectRetentionAction)
+		holdPerms := isPutActionAllowed(ctx, getRequestAuthType(authReq), bucket, object, authReq, policy.PutObjectLegalHoldAction)
+
 		opts.MTime = info.ModTime()
 		if opts.MTime.Unix() <= 0 {
 			opts.MTime = UTCNow()
 		}
 		opts.IndexCB = idxCb
 
-		retentionMode, retentionDate, legalHold, s3err := checkPutObjectLockAllowed(ctx, r, bucket, object, getObjectInfo, retPerms, holdPerms)
+		retentionMode, retentionDate, legalHold, s3err := checkPutObjectLockAllowed(ctx, authReq, bucket, object, getObjectInfo, retPerms, holdPerms)
 		if s3err == ErrNone && retentionMode.Valid() {
 			metadata[strings.ToLower(xhttp.AmzObjectLockMode)] = string(retentionMode)
 			metadata[strings.ToLower(xhttp.AmzObjectLockRetainUntilDate)] = amztime.ISO8601Format(retentionDate.UTC())
@@ -2628,13 +2688,13 @@ func (api objectAPIHandlers) DeleteObjectHandler(w http.ResponseWriter, r *http.
 		return
 	}
 	authInfo, err := objectAPI.GetObjectInfo(ctx, bucket, object, opts)
-	if err != nil && !isErrObjectNotFound(err) && !isErrVersionNotFound(err) && (!authInfo.DeleteMarker || !isErrMethodNotAllowed(err)) {
-		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
-		return
-	}
 	// Keep the authenticated headers available for retention-bypass checks.
-	authReq := r.Clone(ctx)
-	setExistingObjectTags(authReq.Header, authInfo.UserTags)
+	authReq := r.Clone(r.Context())
+	if err == nil {
+		setExistingObjectTags(authReq, authInfo.UserTags)
+	} else {
+		setExistingObjectTags(authReq, "")
+	}
 	if s3Error := authorizeRequest(ctx, authReq, policy.DeleteObjectAction); s3Error != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 		return
@@ -2646,6 +2706,11 @@ func (api objectAPIHandlers) DeleteObjectHandler(w http.ResponseWriter, r *http.
 			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 			return
 		}
+	}
+
+	if err != nil && !isErrObjectNotFound(err) && !isErrVersionNotFound(err) && (!authInfo.DeleteMarker || !isErrMethodNotAllowed(err)) {
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+		return
 	}
 
 	if globalDNSConfig != nil {
@@ -2697,7 +2762,9 @@ func (api objectAPIHandlers) DeleteObjectHandler(w http.ResponseWriter, r *http.
 	opts.SetEvalRetentionBypassFn(func(goi ObjectInfo, gerr error) (err error) {
 		err = nil
 		if vID != "" {
-			err := enforceRetentionBypassForDelete(ctx, r, bucket, ObjectToDelete{
+			authReq := r.Clone(r.Context())
+			setExistingObjectTags(authReq, goi.UserTags)
+			err := enforceRetentionBypassForDelete(ctx, authReq, bucket, ObjectToDelete{
 				ObjectV: ObjectV{
 					ObjectName: object,
 					VersionID:  vID,
@@ -2814,7 +2881,12 @@ func (api objectAPIHandlers) PutObjectLegalHoldHandler(w http.ResponseWriter, r 
 	}
 
 	// Check permissions to perform this legal hold operation
-	if s3Err := checkRequestAuthType(ctx, r, policy.PutObjectLegalHoldAction, bucket, object); s3Err != ErrNone {
+	if s3Err := authenticateRequest(ctx, r, policy.PutObjectLegalHoldAction); s3Err != ErrNone {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Err), r.URL)
+		return
+	}
+
+	if s3Err := authorizeObjectTagRequest(ctx, r, objectAPI, policy.PutObjectLegalHoldAction, bucket, object); s3Err != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Err), r.URL)
 		return
 	}
@@ -2851,6 +2923,11 @@ func (api objectAPIHandlers) PutObjectLegalHoldHandler(w http.ResponseWriter, r 
 		MTime:     opts.MTime,
 		VersionID: opts.VersionID,
 		EvalMetadataFn: func(oi *ObjectInfo, gerr error) (ReplicateDecision, error) {
+			authReq := r.Clone(r.Context())
+			setExistingObjectTags(authReq, oi.UserTags)
+			if s3Err := authorizeRequest(ctx, authReq, policy.PutObjectLegalHoldAction); s3Err != ErrNone {
+				return ReplicateDecision{}, errAuthentication
+			}
 			oi.UserDefined[strings.ToLower(xhttp.AmzObjectLockLegalHold)] = strings.ToUpper(string(legalHold.Status))
 			oi.UserDefined[ReservedMetadataPrefixLower+ObjectLockLegalHoldTimestamp] = UTCNow().Format(time.RFC3339Nano)
 
@@ -2926,7 +3003,7 @@ func (api objectAPIHandlers) GetObjectLegalHoldHandler(w http.ResponseWriter, r 
 	}
 
 	objInfo, err := getObjectInfo(ctx, bucket, object, opts)
-	setExistingObjectTags(r.Header, objInfo.UserTags)
+	setExistingObjectTags(r, objInfo.UserTags)
 	if s3Error := authorizeRequest(ctx, r, policy.GetObjectLegalHoldAction); s3Error != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 		return
@@ -3017,7 +3094,9 @@ func (api objectAPIHandlers) PutObjectRetentionHandler(w http.ResponseWriter, r 
 		MTime:     opts.MTime,
 		VersionID: opts.VersionID,
 		EvalMetadataFn: func(oi *ObjectInfo, gerr error) (dsc ReplicateDecision, err error) {
-			if err := enforceRetentionBypassForPut(ctx, r, *oi, objRetention, reqInfo.Cred, reqInfo.Owner); err != nil {
+			authReq := r.Clone(r.Context())
+			setExistingObjectTags(authReq, oi.UserTags)
+			if err := enforceRetentionBypassForPut(ctx, authReq, *oi, objRetention, reqInfo.Cred, reqInfo.Owner); err != nil {
 				return dsc, err
 			}
 			if objRetention.Mode.Valid() {
@@ -3099,7 +3178,7 @@ func (api objectAPIHandlers) GetObjectRetentionHandler(w http.ResponseWriter, r 
 	}
 
 	objInfo, err := getObjectInfo(ctx, bucket, object, opts)
-	setExistingObjectTags(r.Header, objInfo.UserTags)
+	setExistingObjectTags(r, objInfo.UserTags)
 	if s3Error := authorizeRequest(ctx, r, policy.GetObjectRetentionAction); s3Error != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 		return
@@ -3196,7 +3275,7 @@ func (api objectAPIHandlers) GetObjectTaggingHandler(w http.ResponseWriter, r *h
 		}
 	}
 
-	setExistingObjectTags(r.Header, ot.String())
+	setExistingObjectTags(r, ot.String())
 
 	if s3Error := authorizeRequest(ctx, r, policy.GetObjectTaggingAction); s3Error != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
@@ -3259,8 +3338,35 @@ func (api objectAPIHandlers) PutObjectTaggingHandler(w http.ResponseWriter, r *h
 		return
 	}
 
-	// Set this such that authorization policies can be applied on the object tags.
-	r.Header.Set(xhttp.AmzObjectTagging, tags.String())
+	setRequestObjectTags(r, tags.String())
+	opts, err := getOpts(ctx, r, bucket, object)
+	if err != nil {
+		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
+		return
+	}
+	objInfo, err := objAPI.GetObjectInfo(ctx, bucket, object, opts)
+	setExistingObjectTags(r, "")
+	if err == nil {
+		setExistingObjectTagsForVersion(r, objInfo.UserTags, opts.VersionID)
+	} else if isErrObjectNotFound(err) || isErrVersionNotFound(err) {
+		proxytgts := getProxyTargets(ctx, bucket, object, opts)
+		if !proxytgts.Empty() {
+			remoteTags, perr := proxyGetTaggingToRepTarget(ctx, bucket, object, opts, proxytgts)
+			if perr.Err != nil {
+				if s3Error := authorizeRequest(ctx, r, policy.PutObjectTaggingAction); s3Error != ErrNone {
+					writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+					return
+				}
+				writeErrorResponse(ctx, w, toAPIError(ctx, perr.Err), r.URL)
+				return
+			}
+			if remoteTags == nil {
+				writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrAccessDenied), r.URL)
+				return
+			}
+			setExistingObjectTagsForVersion(r, remoteTags.String(), opts.VersionID)
+		}
+	}
 
 	// Allow putObjectTagging if policy action is set
 	if s3Error := authorizeRequest(ctx, r, policy.PutObjectTaggingAction); s3Error != ErrNone {
@@ -3268,13 +3374,6 @@ func (api objectAPIHandlers) PutObjectTaggingHandler(w http.ResponseWriter, r *h
 		return
 	}
 
-	opts, err := getOpts(ctx, r, bucket, object)
-	if err != nil {
-		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
-		return
-	}
-
-	objInfo, err := objAPI.GetObjectInfo(ctx, bucket, object, opts)
 	if err != nil {
 		// if object is not found locally, but exists on peer site - proxy
 		// the tagging request to peer site. The response to client will
@@ -3396,7 +3495,7 @@ func (api objectAPIHandlers) DeleteObjectTaggingHandler(w http.ResponseWriter, r
 					writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 					return
 				}
-				setExistingObjectTags(r.Header, remoteTags.String())
+				setExistingObjectTags(r, remoteTags.String())
 				if s3Error := authorizeRequest(ctx, r, policy.DeleteObjectTaggingAction); s3Error != ErrNone {
 					writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 					return
@@ -3428,7 +3527,7 @@ func (api objectAPIHandlers) DeleteObjectTaggingHandler(w http.ResponseWriter, r
 		return
 	}
 
-	setExistingObjectTags(r.Header, oi.UserTags)
+	setExistingObjectTags(r, oi.UserTags)
 
 	// Allow deleteObjectTagging if policy action is set
 	if s3Error := authorizeRequest(ctx, r, policy.DeleteObjectTaggingAction); s3Error != ErrNone {
@@ -3492,7 +3591,11 @@ func (api objectAPIHandlers) PostRestoreObjectHandler(w http.ResponseWriter, r *
 	getObjectInfo := objectAPI.GetObjectInfo
 
 	// Check for auth type to return S3 compatible error.
-	if s3Error := checkRequestAuthType(ctx, r, policy.RestoreObjectAction, bucket, object); s3Error != ErrNone {
+	if s3Error := authenticateRequest(ctx, r, policy.RestoreObjectAction); s3Error != ErrNone {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+		return
+	}
+	if s3Error := authorizeObjectTagRequest(ctx, r, objectAPI, policy.RestoreObjectAction, bucket, object); s3Error != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 		return
 	}

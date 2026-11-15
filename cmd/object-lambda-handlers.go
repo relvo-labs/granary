@@ -169,8 +169,9 @@ func (api objectAPIHandlers) GetObjectLambdaHandler(w http.ResponseWriter, r *ht
 		return
 	}
 	objInfo, err := objectAPI.GetObjectInfo(ctx, bucket, object, opts)
-	setExistingObjectTags(r.Header, objInfo.UserTags)
-	if s3Error := authorizeRequest(ctx, r, policy.GetObjectAction); s3Error != ErrNone {
+	authReq := r.Clone(r.Context())
+	setExistingObjectTags(authReq, objInfo.UserTags)
+	if s3Error := authorizeRequest(ctx, authReq, policy.GetObjectAction); s3Error != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 		return
 	}

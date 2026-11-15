@@ -148,9 +148,6 @@ func TestAPIExistingObjectTagsSiblingReads(t *testing.T) {
 func testAPIExistingObjectTagsSiblingReads(obj ObjectLayer, instanceType, bucket string, router http.Handler, _ auth.Credentials, t *testing.T) {
 	globalBucketMetadataSys.Set(bucket, newBucketMetadata(bucket))
 	user := newTaggingTestUser(t)
-	setTaggingTestPolicy(t, bucket, user, fmt.Sprintf(
-		`{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::%s/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/test":"value"}}},
-		{"Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::%s/destination","Condition":{"StringEquals":{"s3:RequestObjectTag/test":["destination","value"]}}}`, bucket, bucket))
 
 	var archive bytes.Buffer
 	zw := zip.NewWriter(&archive)
@@ -201,6 +198,14 @@ func testAPIExistingObjectTagsSiblingReads(obj ObjectLayer, instanceType, bucket
 					cred auth.Credentials
 				}{{"signed-user", user}, {"anonymous", auth.AnonymousCredentials}} {
 					t.Run(fmt.Sprintf("%s/%s/stored=%s/client=%s/%s", instanceType, identity.name, stored, client, operation), func(t *testing.T) {
+						condition := `,"Condition":{"StringEquals":{"s3:RequestObjectTag/test":["destination","value"]}}`
+						if operation == "copy-part" {
+							// UploadPartCopy has no tagging input; tags belong to initiation.
+							condition = ""
+						}
+						setTaggingTestPolicy(t, bucket, user, fmt.Sprintf(
+							`{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::%s/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/test":"value"}}},
+							{"Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::%s/destination"%s}`, bucket, bucket, condition))
 						object, data := "source", "data"
 						header := http.Header{}
 						header.Set(xhttp.AmzObjectTagging, client)

@@ -121,6 +121,8 @@ func runObjectLambdaTest(t *testing.T, lambdaStatus int, lambdaBody, contentType
 				t.Fatalf("failed to load lambda targets: %v", err)
 			}
 
+			previousEvent := getLambdaEventData
+			defer func() { getLambdaEventData = previousEvent }()
 			getLambdaEventData = func(_, _ string, _ auth.Credentials, _ *http.Request) (levent.Event, error) {
 				return levent.Event{
 					GetObjectContext: &levent.GetObjectContext{

@@ -135,7 +135,7 @@ func (api objectAPIHandlers) getObjectInArchiveFileHandler(ctx context.Context, 
 			return true
 		}
 
-		setExistingObjectTags(r.Header, oi.UserTags)
+		setExistingObjectTags(r, oi.UserTags)
 		if s3Error := authorizeRequest(ctx, r, policy.GetObjectAction); s3Error != ErrNone {
 			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 			return true
@@ -144,7 +144,7 @@ func (api objectAPIHandlers) getObjectInArchiveFileHandler(ctx context.Context, 
 	}
 
 	zipObjInfo, err := getObjectInfo(ctx, bucket, zipPath, opts)
-	setExistingObjectTags(r.Header, zipObjInfo.UserTags)
+	setExistingObjectTags(r, zipObjInfo.UserTags)
 	if s3Error := authorizeRequest(ctx, r, policy.GetObjectAction); s3Error != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 		return
@@ -428,7 +428,7 @@ func (api objectAPIHandlers) headObjectInArchiveFileHandler(ctx context.Context,
 
 	// Validate pre-conditions if any.
 	opts.CheckPrecondFn = func(oi ObjectInfo) bool {
-		setExistingObjectTags(r.Header, oi.UserTags)
+		setExistingObjectTags(r, oi.UserTags)
 		if s3Error := authorizeRequest(ctx, r, policy.GetObjectAction); s3Error != ErrNone {
 			writeErrorResponseHeadersOnly(w, errorCodes.ToAPIErr(s3Error))
 			return true
@@ -448,7 +448,7 @@ func (api objectAPIHandlers) headObjectInArchiveFileHandler(ctx context.Context,
 	}
 
 	zipObjInfo, err := getObjectInfo(ctx, bucket, zipPath, opts)
-	setExistingObjectTags(r.Header, zipObjInfo.UserTags)
+	setExistingObjectTags(r, zipObjInfo.UserTags)
 	if s3Error := authorizeRequest(ctx, r, policy.GetObjectAction); s3Error != ErrNone {
 		writeErrorResponseHeadersOnly(w, errorCodes.ToAPIErr(s3Error))
 		return
