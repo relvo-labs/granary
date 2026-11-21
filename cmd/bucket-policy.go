@@ -154,17 +154,16 @@ func reservedConditionInput(name string, claims map[string]any) bool {
 	return false
 }
 
-// contentSHA256ConditionValues returns the payload hash the SigV4 verifier
-// selected: the query parameter for presigned requests (falling back to the
-// header, as getContentSha256Cksum does), the header otherwise. A presigned
-// request signs only its query, so its header value is not authenticated.
+// contentSHA256ConditionValues returns only the payload hash the SigV4
+// verifier selected (see contentSha256Value): the first query value for
+// presigned requests, the first header value otherwise. A presigned request
+// signs only its query, so its header value is not authenticated, and values
+// repeated after the first are neither signed nor checked against the body.
 func contentSHA256ConditionValues(r *http.Request) []string {
-	if isRequestPresignedSignatureV4(r) {
-		if values, ok := r.Form[xhttp.AmzContentSha256]; ok {
-			return values
-		}
+	if value, ok := contentSha256Value(r); ok {
+		return []string{value}
 	}
-	return r.Header.Values(xhttp.AmzContentSha256)
+	return nil
 }
 
 func getConditionValues(r *http.Request, lc string, cred auth.Credentials) map[string][]string {
