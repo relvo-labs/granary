@@ -191,13 +191,10 @@ func getConditionValues(r *http.Request, lc string, cred auth.Credentials) map[s
 		}
 	}
 
+	// s3:versionid is the version this request selects. Handlers that authorize
+	// another object (copy sources, multi-delete entries) set it explicitly;
+	// X-Amz-Copy-Source never supplies it for the request's own object.
 	vid := r.Form.Get(xhttp.VersionID)
-	if vid == "" {
-		if u, err := url.Parse(r.Header.Get(xhttp.AmzCopySource)); err == nil {
-			vid = u.Query().Get(xhttp.VersionID)
-		}
-	}
-
 	if values, ok := r.Context().Value(objectTagConditionKey{}).(objectTagConditions); ok && values.versionID != nil {
 		vid = *values.versionID
 	}
