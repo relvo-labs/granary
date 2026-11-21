@@ -180,8 +180,8 @@ func TestPReaderNoNewlineBounded(t *testing.T) {
 	if code := errorCode(err); code != overMaxRecordSizeCode {
 		t.Fatalf("want %s error, got %v (code %q)", overMaxRecordSizeCode, err, code)
 	}
-	if max := int64(jsonSplitSize + testMaxLineSize + 4*jsonSplitSize*2); src.n > max {
-		t.Fatalf("consumed %d bytes of input, want <= %d", src.n, max)
+	if limit := int64(jsonSplitSize + testMaxLineSize + 4*jsonSplitSize*2); src.n > limit {
+		t.Fatalf("consumed %d bytes of input, want <= %d", src.n, limit)
 	}
 }
 
