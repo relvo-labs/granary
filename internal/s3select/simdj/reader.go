@@ -18,6 +18,8 @@
 package simdj
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"sync"
@@ -48,6 +50,10 @@ func (r *Reader) Read(dst sql.Record) (sql.Record, error) {
 	v, ok := <-r.decoded
 	if !ok {
 		if r.err != nil && *r.err != nil {
+			var se *s3Error
+			if errors.As(*r.err, &se) {
+				return nil, se
+			}
 			return nil, errJSONParsingError(*r.err)
 		}
 		return nil, io.EOF
@@ -170,7 +176,9 @@ func NewReader(readCloser io.ReadCloser, args *json.ReaderArgs) *Reader {
 	}
 
 	// We cannot reuse as we are sending parsed objects elsewhere.
-	simdjson.ParseNDStream(readCloser, r.input, nil)
+	// ParseNDStream reads a block and then calls bufio.Reader.ReadBytes('\n')
+	// without any bound, so limit the line length before handing it the input.
+	simdjson.ParseNDStream(newLineLimitReader(readCloser, maxLineSize), r.input, nil)
 	r.readerWg.Add(1)
 	go r.startReader()
 	return &r
@@ -184,6 +192,54 @@ func NewElementReader(ch chan simdjson.Object, err *error, args *json.ReaderArgs
 		err:        err,
 		readCloser: nil,
 	}
+}
+
+// maxLineSize is the maximum length in bytes of a single JSON Lines input
+// line, excluding its newline. It matches the S3 Select maxCharsPerRecord
+// limit of 1 MB and the per-line limit of the portable json.PReader and the
+// CSV reader.
+const maxLineSize = 1 << 20
+
+// lineLimitReader fails with OverMaxRecordSize once more than limit bytes have
+// been read without a newline (issue #79). simdjson.ParseNDStream otherwise
+// buffers a newline-free input until EOF. The error is sticky and the bytes
+// of the failing read are discarded, so callers buffer at most one read
+// beyond limit bytes of the current line.
+type lineLimitReader struct {
+	r     io.Reader
+	limit int
+	run   int // bytes since the last newline
+	err   error
+}
+
+func newLineLimitReader(r io.Reader, limit int) *lineLimitReader {
+	return &lineLimitReader{r: r, limit: limit}
+}
+
+func (l *lineLimitReader) Read(p []byte) (int, error) {
+	if l.err != nil {
+		return 0, l.err
+	}
+	n, err := l.r.Read(p)
+	b := p[:n]
+	for len(b) > 0 {
+		i := bytes.IndexByte(b, '\n')
+		if i < 0 {
+			l.run += len(b)
+			break
+		}
+		l.run += i
+		if l.run > l.limit {
+			break
+		}
+		l.run = 0
+		b = b[i+1:]
+	}
+	if l.run > l.limit {
+		l.err = errOverMaxRecordSize()
+		return 0, l.err
+	}
+	return n, err
 }
 
 // safeCloser will wrap a Reader as a ReadCloser.
