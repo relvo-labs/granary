@@ -248,13 +248,14 @@ var ErrLoginThrottled = errors.New("too many failed LDAP logins")
 // search bases), or an entry's DN cannot be parsed. Such a username can
 // never log in, and the outcome depends on the directory's entries for it,
 // so the client gets the same response as for any rejected credentials.
-// It is a directory configuration problem rather than a guess, so Login
-// does not count it as a failed attempt.
+// Login also counts it as a failed attempt, exactly like a wrong password:
+// otherwise such a name would be told apart by never being throttled, and
+// throttling a name that cannot log in anyway costs nothing.
 var ErrUnusableAccount = errors.New("LDAP user search did not yield exactly one usable entry")
 
 // isUserNotFound reports whether err from LookupUsername means that the
-// search succeeded but matched no entry. Only this outcome is a counted
-// credential failure. Account-dependent unusable results are recognised by
+// search succeeded but matched no entry, a counted credential failure.
+// Account-dependent unusable results, also counted, are recognized by
 // isUnusableAccount; every other lookup error (the directory refused or
 // failed the search) is a server-side problem that is reported as such and
 // is not counted against the username.
@@ -375,9 +376,9 @@ func (l *Config) Bind(username, password string) (*xldap.DNSearchResult, []strin
 //     rejection of unknown accounts is not visible. The wait happens after
 //     the limiter is updated and without holding its lock.
 //   - A username whose search yields no single usable entry also wraps
-//     ErrInvalidCredentials (and ErrUnusableAccount) and is delayed the same
-//     way, but is not counted; its reservation is held until the delay ends,
-//     so that releasing it does not reveal the directory's timing either.
+//     ErrInvalidCredentials (and ErrUnusableAccount) and is counted and
+//     delayed exactly the same way, so that neither the limiter nor the
+//     timing distinguishes it from a wrong password.
 //   - Any other error means the directory could not be queried; it is not
 //     counted and not delayed.
 //
@@ -405,15 +406,8 @@ func (l *Config) Login(ctx context.Context, username, password, sourceIP string)
 	}
 	lookupResult, groups, err := bind(username, password)
 	invalid := errors.Is(err, ErrInvalidCredentials)
-	switch {
-	case !invalid:
-		attempt.Finish(false)
-	case !errors.Is(err, ErrUnusableAccount):
-		attempt.Finish(true)
-	}
+	attempt.Finish(invalid)
 	if invalid {
-		// An unusable account's reservation is released by the deferred
-		// Abort, after the wait.
 		floor.wait(start)
 	}
 	if err != nil {

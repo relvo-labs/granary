@@ -45,7 +45,7 @@ type fakeDirectory struct {
 	mu        sync.Mutex
 	users     map[string]fakeUser // uid -> account
 	searchErr map[string]uint16   // uid -> result code of the user search
-	searchDNs map[string][]string // uid -> entries returned by the user search, overriding users
+	searchDNS map[string][]string // uid -> entries returned by the user search, overriding users
 
 	conns atomic.Int64 // connections accepted
 
@@ -77,7 +77,7 @@ func newFakeDirectory(t *testing.T, passwordCost time.Duration) *fakeDirectory {
 		passwordCost: passwordCost,
 		users:        map[string]fakeUser{},
 		searchErr:    map[string]uint16{},
-		searchDNs:    map[string][]string{},
+		searchDNS:    map[string][]string{},
 		ln:           ln,
 	}
 	d.wg.Add(1)
@@ -106,7 +106,7 @@ func (d *fakeDirectory) failSearch(uid string, code uint16) {
 func (d *fakeDirectory) returnEntries(uid string, dns ...string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.searchDNs[uid] = dns
+	d.searchDNS[uid] = dns
 }
 
 func (d *fakeDirectory) userDN(uid string) string { return "uid=" + uid + "," + d.baseDN }
@@ -229,7 +229,7 @@ func (d *fakeDirectory) search(msgID int64, op *ber.Packet) []*ber.Packet {
 	d.mu.Lock()
 	code, failing := d.searchErr[uid]
 	_, exists := d.users[uid]
-	dns, override := d.searchDNs[uid]
+	dns, override := d.searchDNS[uid]
 	d.mu.Unlock()
 	if failing {
 		return []*ber.Packet{done(code)}

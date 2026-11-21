@@ -36,7 +36,7 @@ import (
 // Regression tests for timing and state side channels of rejected logins.
 // They use the helpers in loginlimit_adapter_test.go only.
 
-// A cancelled request context must not end the minimum response time early:
+// A canceled request context must not end the minimum response time early:
 // the caller writes the rejection as soon as Login returns.
 func TestLoginMinResponseTimeIgnoresCancellation(t *testing.T) {
 	const minResponse = 300 * time.Millisecond
@@ -52,7 +52,7 @@ func TestLoginMinResponseTimeIgnoresCancellation(t *testing.T) {
 		t.Fatalf("expected invalid credentials, got %v", err)
 	}
 	if took < minResponse {
-		t.Fatalf("rejection with a cancelled context returned after %v, before the minimum response time %v", took, minResponse)
+		t.Fatalf("rejection with a canceled context returned after %v, before the minimum response time %v", took, minResponse)
 	}
 }
 
@@ -66,7 +66,7 @@ func TestLoginMinResponseTimeSurvivesHalfClose(t *testing.T) {
 	cfg := d.config(t)
 	setLoginMinResponseTime(cfg, minResponse)
 
-	cancelled := make(chan bool, 1)
+	canceled := make(chan bool, 1)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if err := r.ParseForm(); err != nil {
 			http.Error(w, "bad form", http.StatusBadRequest)
@@ -75,7 +75,7 @@ func TestLoginMinResponseTimeSurvivesHalfClose(t *testing.T) {
 		// Same shape as the STS handler: the request context goes to
 		// Login, and the rejection is written when Login returns.
 		err := testLogin(r.Context(), cfg, r.Form.Get("u"), r.Form.Get("p"), "10.0.0.1")
-		cancelled <- r.Context().Err() != nil
+		canceled <- r.Context().Err() != nil
 		if errors.Is(err, ErrInvalidCredentials) {
 			http.Error(w, "invalid username or password", http.StatusBadRequest)
 			return
@@ -119,7 +119,7 @@ func TestLoginMinResponseTimeSurvivesHalfClose(t *testing.T) {
 		t.Fatalf("expected the uniform 400 rejection, got %q (read err %v)", resp, rerr)
 	}
 	select {
-	case c := <-cancelled:
+	case c := <-canceled:
 		if !c {
 			t.Log("note: the server did not cancel the request context on half-close")
 		}
@@ -221,17 +221,22 @@ func TestLoginFailureLimiterWindowIndependentOfCompletionOrder(t *testing.T) {
 
 // A username whose search yields no usable single entry (several matching
 // entries, or a malformed entry DN) depends on the account, so it must look
-// like any other credential rejection: same error class and the same
-// minimum response time. It is not counted as a failed guess, and its
-// reservation is held until the response deadline, like a counted failure.
+// exactly like a wrong password: same error class, the same minimum response
+// time, the same limiter state while waiting, and the same failure count, so that it is throttled after the same number of attempts. If it
+// were not counted, a client could tell such a name apart by never getting
+// HTTP 429 for it.
 func TestLoginUnusableLookupIsUniformRejection(t *testing.T) {
-	const minResponse = time.Second
+	const (
+		minResponse = time.Second
+		userLimit   = 2
+	)
 	d := newFakeDirectory(t, 0)
+	d.addUser("alice", fakeUser{password: "alice-pass"})
 	d.returnEntries("twin", d.userDN("twin"), "uid=twin,ou=other,"+d.baseDN)
 	d.returnEntries("mangled", "uid=mangled,,=bad")
 	cfg := d.config(t)
 	clk := &fakeClock{t: time.Unix(1_700_000_000, 0)}
-	l, _ := newTestLimiter(LoginLimitConfig{UserLimit: 1, IPLimit: 2, Window: time.Minute})
+	l, _ := newTestLimiter(LoginLimitConfig{UserLimit: userLimit, IPLimit: 100, Window: time.Minute})
 	var waits []time.Duration
 	var pendingDuringWait [][2]int
 	setLoginFakeClock(cfg, l, clk, minResponse, func(dur time.Duration) {
@@ -239,30 +244,35 @@ func TestLoginUnusableLookupIsUniformRejection(t *testing.T) {
 		u, ip := l.pending()
 		pendingDuringWait = append(pendingDuringWait, [2]int{u, ip})
 	})
-	for _, user := range []string{"twin", "mangled"} {
-		for i := range 3 {
+	// alice with a wrong password is the reference behavior. Each name
+	// uses its own address so that only the per-username limit applies.
+	var refPending [2]int
+	for n, user := range []string{"alice", "twin", "mangled"} {
+		ip := fmt.Sprintf("10.0.0.%d", n+1)
+		for i := range userLimit {
 			waits, pendingDuringWait = nil, nil
-			err := testLogin(context.Background(), cfg, user, "guess", "10.0.0.1")
+			err := testLogin(context.Background(), cfg, user, "guess", ip)
 			if !errors.Is(err, ErrInvalidCredentials) {
 				t.Fatalf("%s attempt %d: expected the uniform credential rejection, got %v", user, i+1, err)
 			}
 			if len(waits) != 1 || waits[0] != minResponse {
 				t.Fatalf("%s attempt %d: expected one wait of %v, got %v", user, i+1, minResponse, waits)
 			}
-			if pendingDuringWait[0] != [2]int{1, 1} {
-				t.Fatalf("%s attempt %d: reservation released before the response deadline: %v", user, i+1, pendingDuringWait[0])
+			if user == "alice" {
+				refPending = pendingDuringWait[0]
+			} else if pendingDuringWait[0] != refPending {
+				t.Fatalf("%s attempt %d: limiter state during the wait %v differs from a wrong password's %v", user, i+1, pendingDuringWait[0], refPending)
 			}
+		}
+		waits = nil
+		if err := testLogin(context.Background(), cfg, user, "guess", ip); !errors.Is(err, ErrLoginThrottled) {
+			t.Fatalf("%s: expected throttling after %d failed attempts, like a wrong password, got %v", user, userLimit, err)
+		}
+		if len(waits) != 0 {
+			t.Fatalf("%s: throttled attempt waited %v", user, waits)
 		}
 	}
 	if u, ip := l.pending(); u != 0 || ip != 0 {
 		t.Fatalf("reservations left: %d users, %d ips", u, ip)
-	}
-	// Not counted: neither the usernames nor the address are throttled.
-	for _, user := range []string{"twin", "mangled"} {
-		finish, ok := testReserve(l, user, "10.0.0.1")
-		if !ok {
-			t.Fatalf("unusable lookups for %q were counted as failed logins", user)
-		}
-		finish(false)
 	}
 }

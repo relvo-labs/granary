@@ -262,7 +262,7 @@ func TestLoginConcurrent(t *testing.T) {
 	}
 }
 
-// The no-match outcome of the user search is recognised positively.
+// The no-match outcome of the user search is recognized positively.
 func TestIsUserNotFound(t *testing.T) {
 	d := newFakeDirectory(t, 0)
 	cfg := d.config(t)
@@ -276,7 +276,7 @@ func TestIsUserNotFound(t *testing.T) {
 	}
 	_, err = cfg.LDAP.LookupUsername(conn, "nosuchuser")
 	if err == nil || !isUserNotFound(err) {
-		t.Fatalf("expected the no-match error to be recognised, got %v", err)
+		t.Fatalf("expected the no-match error to be recognized, got %v", err)
 	}
 	d.failSearch("broken", ldap.LDAPResultInsufficientAccessRights)
 	_, err = cfg.LDAP.LookupUsername(conn, "broken")
