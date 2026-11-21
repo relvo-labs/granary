@@ -152,20 +152,34 @@ func TestLoginMinResponseTimeDeterministic(t *testing.T) {
 	}
 }
 
-// The wait happens after the limiter is updated and without its lock, so
-// that other logins are not blocked while a rejection is delayed.
+// The wait does not hold the limiter's lock, so that other logins are not
+// blocked while a rejection is delayed. The rejected attempt stays reserved
+// (pending, not yet counted) during the wait and is counted after it, so
+// that the limiter changes at a time that does not depend on the directory.
 func TestLoginMinResponseTimeDoesNotHoldLimiter(t *testing.T) {
 	d := newFakeDirectory(t, 0)
 	cfg := d.config(t)
 	l, _ := newTestLimiter(LoginLimitConfig{UserLimit: 5, IPLimit: 100, Window: time.Minute})
 	setLoginLimiter(cfg, l)
 	rec := &recordingFloor{clk: &fakeClock{t: time.Unix(1_700_000_000, 0)}}
-	var pendingDuringWait [2]int
+	var pendingDuringWait, failuresDuringWait [2]int
+	failures := func() (users, ips int) {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		for _, e := range l.users.entries {
+			users += e.failures
+		}
+		for _, e := range l.ips.entries {
+			ips += e.failures
+		}
+		return users, ips
+	}
 	rec.hook = func() {
 		done := make(chan struct{})
 		go func() {
 			defer close(done)
 			pendingDuringWait[0], pendingDuringWait[1] = l.pending()
+			failuresDuringWait[0], failuresDuringWait[1] = failures()
 		}()
 		select {
 		case <-done:
@@ -177,8 +191,14 @@ func TestLoginMinResponseTimeDoesNotHoldLimiter(t *testing.T) {
 	if _, _, err := cfg.Login(context.Background(), "nosuchuser", "guess", "10.0.0.1"); !errors.Is(err, ErrInvalidCredentials) {
 		t.Fatalf("expected invalid credentials, got %v", err)
 	}
-	if pendingDuringWait != [2]int{0, 0} {
-		t.Fatalf("reservation still held during the wait: %v", pendingDuringWait)
+	if pendingDuringWait != [2]int{1, 1} || failuresDuringWait != [2]int{0, 0} {
+		t.Fatalf("expected the attempt to stay reserved and uncounted during the wait, got pending %v failures %v", pendingDuringWait, failuresDuringWait)
+	}
+	if u, ip := l.pending(); u != 0 || ip != 0 {
+		t.Fatalf("reservation still held after the wait: %d users, %d ips", u, ip)
+	}
+	if u, ip := failures(); u != 1 || ip != 1 {
+		t.Fatalf("expected the rejection to be counted after the wait, got %d users, %d ips", u, ip)
 	}
 }
 

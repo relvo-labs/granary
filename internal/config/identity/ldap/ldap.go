@@ -373,8 +373,12 @@ func (l *Config) Bind(username, password string) (*xldap.DNSearchResult, []strin
 //     wrap ErrInvalidCredentials and are counted, as of the time the attempt
 //     was reserved. They return no earlier than the configured minimum
 //     response time after Login was called, so that the directory's faster
-//     rejection of unknown accounts is not visible. The wait happens after
-//     the limiter is updated and without holding its lock.
+//     rejection of unknown accounts is not visible. The attempt stays
+//     reserved during that wait and is counted when it ends, so that the
+//     limiter, too, changes at a time that does not depend on the
+//     directory. The wait does not hold the limiter's lock. With a zero
+//     minimum response time neither the response nor the limiter hides
+//     the directory's timing.
 //   - A username whose search yields no single usable entry also wraps
 //     ErrInvalidCredentials (and ErrUnusableAccount) and is counted and
 //     delayed exactly the same way, so that neither the limiter nor the
@@ -405,11 +409,20 @@ func (l *Config) Login(ctx context.Context, username, password, sourceIP string)
 		bind = l.bindFn
 	}
 	lookupResult, groups, err := bind(username, password)
-	invalid := errors.Is(err, ErrInvalidCredentials)
-	attempt.Finish(invalid)
-	if invalid {
+	if errors.Is(err, ErrInvalidCredentials) {
+		// Count the failure only once the minimum response time has
+		// passed. The reservation stays pending until then, so every
+		// rejection that the directory answered within the minimum
+		// changes the limiter at the same time after it was reserved.
+		// Otherwise an attempt in flight when its key's window ends
+		// would land in the old or the new window depending on the
+		// directory's speed, and later requests would see a different
+		// number of failures. The wait does not hold the limiter's lock.
 		floor.wait(start)
+		attempt.Finish(true)
+		return nil, nil, err
 	}
+	attempt.Finish(false)
 	if err != nil {
 		return nil, nil, err
 	}

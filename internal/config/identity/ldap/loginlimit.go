@@ -372,6 +372,14 @@ func (t *loginFailureTable) hasRoom(now time.Time, window time.Duration, maxEntr
 // failures. The result therefore does not depend on how long each attempt
 // took or on the order in which concurrent attempts complete, as long as
 // each completes within one window of being reserved.
+//
+// Expiry (see expire) still treats completed failures and pending
+// reservations differently: a window's failures are dropped when it ends,
+// while an attempt still in flight keeps the entry and is placed when it
+// completes. Config.Login therefore completes rejected attempts only after
+// the minimum response time, at the same delay after their reservation
+// whatever the directory took, so that which attempts are still pending at
+// any moment does not depend on the directory either.
 func (t *loginFailureTable) finish(key loginKey, e *loginFailure, reserved, now time.Time, window time.Duration, failed bool) {
 	if e.pending > 0 {
 		e.pending--
