@@ -2991,11 +2991,6 @@ func (api objectAPIHandlers) GetObjectLegalHoldHandler(w http.ResponseWriter, r 
 
 	getObjectInfo := objectAPI.GetObjectInfo
 
-	if rcfg, _ := globalBucketObjectLockSys.Get(bucket); !rcfg.LockEnabled {
-		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrInvalidBucketObjectLockConfiguration), r.URL)
-		return
-	}
-
 	opts, err := getOpts(ctx, r, bucket, object)
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
@@ -3006,6 +3001,12 @@ func (api objectAPIHandlers) GetObjectLegalHoldHandler(w http.ResponseWriter, r 
 	setExistingObjectTags(r, objInfo.UserTags)
 	if s3Error := authorizeRequest(ctx, r, policy.GetObjectLegalHoldAction); s3Error != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+		return
+	}
+
+	// Reveal the bucket's object-lock state only to authorized callers.
+	if rcfg, _ := globalBucketObjectLockSys.Get(bucket); !rcfg.LockEnabled {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrInvalidBucketObjectLockConfiguration), r.URL)
 		return
 	}
 	if err != nil {
@@ -3166,11 +3167,6 @@ func (api objectAPIHandlers) GetObjectRetentionHandler(w http.ResponseWriter, r 
 
 	getObjectInfo := objectAPI.GetObjectInfo
 
-	if rcfg, _ := globalBucketObjectLockSys.Get(bucket); !rcfg.LockEnabled {
-		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrInvalidBucketObjectLockConfiguration), r.URL)
-		return
-	}
-
 	opts, err := getOpts(ctx, r, bucket, object)
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
@@ -3181,6 +3177,12 @@ func (api objectAPIHandlers) GetObjectRetentionHandler(w http.ResponseWriter, r 
 	setExistingObjectTags(r, objInfo.UserTags)
 	if s3Error := authorizeRequest(ctx, r, policy.GetObjectRetentionAction); s3Error != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+		return
+	}
+
+	// Reveal the bucket's object-lock state only to authorized callers.
+	if rcfg, _ := globalBucketObjectLockSys.Get(bucket); !rcfg.LockEnabled {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrInvalidBucketObjectLockConfiguration), r.URL)
 		return
 	}
 	if err != nil {

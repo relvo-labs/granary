@@ -154,6 +154,19 @@ func reservedConditionInput(name string, claims map[string]any) bool {
 	return false
 }
 
+// contentSHA256ConditionValues returns the payload hash the SigV4 verifier
+// selected: the query parameter for presigned requests (falling back to the
+// header, as getContentSha256Cksum does), the header otherwise. A presigned
+// request signs only its query, so its header value is not authenticated.
+func contentSHA256ConditionValues(r *http.Request) []string {
+	if isRequestPresignedSignatureV4(r) {
+		if values, ok := r.Form[xhttp.AmzContentSha256]; ok {
+			return values
+		}
+	}
+	return r.Header.Values(xhttp.AmzContentSha256)
+}
+
 func getConditionValues(r *http.Request, lc string, cred auth.Credentials) map[string][]string {
 	currTime := UTCNow()
 
@@ -244,7 +257,7 @@ func getConditionValues(r *http.Request, lc string, cred auth.Credentials) map[s
 
 	// Tag conditions are filled from typed server state below, never this header.
 	cloneHeader.Del(xhttp.AmzObjectTagging)
-	if values := r.Header.Values(xhttp.AmzContentSha256); len(values) > 0 {
+	if values := contentSHA256ConditionValues(r); len(values) > 0 {
 		args["x-amz-content-sha256"] = values
 	}
 
