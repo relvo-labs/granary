@@ -3139,9 +3139,12 @@ func (api objectAPIHandlers) GetObjectTaggingHandler(w http.ResponseWriter, r *h
 				globalReplicationStats.Load().incProxy(bucket, getObjectTaggingAPI, false)
 				// proxy to replication target if site replication is in place.
 				tags, gerr := proxyGetTaggingToRepTarget(ctx, bucket, object, opts, proxytgts)
-				if gerr.Err != nil || tags == nil {
+				if gerr.Err != nil || !gerr.Proxy || tags == nil {
 					globalReplicationStats.Load().incProxy(bucket, getObjectTaggingAPI, true)
-					writeErrorResponse(ctx, w, toAPIError(ctx, gerr.Err), r.URL)
+					if gerr.Err != nil && !errors.Is(gerr.Err, errProxyNoRemoteResult) {
+						err = gerr.Err
+					}
+					writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 					return
 				} // overlay tags from peer site.
 				ot = tags
@@ -3250,7 +3253,10 @@ func (api objectAPIHandlers) PutObjectTaggingHandler(w http.ResponseWriter, r *h
 				perr := proxyTaggingToRepTarget(ctx, bucket, object, tags, opts, proxytgts)
 				if perr.Err != nil {
 					globalReplicationStats.Load().incProxy(bucket, putObjectTaggingAPI, true)
-					writeErrorResponse(ctx, w, toAPIError(ctx, perr.Err), r.URL)
+					if !errors.Is(perr.Err, errProxyNoRemoteResult) {
+						err = perr.Err
+					}
+					writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 					return
 				}
 				w.Header()[xhttp.MinIOTaggingProxied] = []string{"true"}
@@ -3351,9 +3357,9 @@ func (api objectAPIHandlers) DeleteObjectTaggingHandler(w http.ResponseWriter, r
 				globalReplicationStats.Load().incProxy(bucket, removeObjectTaggingAPI, false)
 				// Remote tags are policy inputs too. Authorize before removing them.
 				remoteTags, perr := proxyGetTaggingToRepTarget(ctx, bucket, object, opts, proxytgts)
-				if perr.Err != nil || remoteTags == nil {
+				if perr.Err != nil || !perr.Proxy || remoteTags == nil {
 					globalReplicationStats.Load().incProxy(bucket, removeObjectTaggingAPI, true)
-					if perr.Err != nil {
+					if perr.Err != nil && !errors.Is(perr.Err, errProxyNoRemoteResult) {
 						err = perr.Err
 					}
 					writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
@@ -3365,10 +3371,13 @@ func (api objectAPIHandlers) DeleteObjectTaggingHandler(w http.ResponseWriter, r
 					return
 				}
 				// proxy to replication target if active-active replication is in place.
-				perr = proxyTaggingToRepTarget(ctx, bucket, object, nil, opts, proxytgts)
+				perr = proxyDeleteTaggingToRepTarget(ctx, object, opts, perr.taggingTargets)
 				if perr.Err != nil {
 					globalReplicationStats.Load().incProxy(bucket, removeObjectTaggingAPI, true)
-					writeErrorResponse(ctx, w, toAPIError(ctx, perr.Err), r.URL)
+					if !errors.Is(perr.Err, errProxyNoRemoteResult) {
+						err = perr.Err
+					}
+					writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 					return
 				}
 				// when delete tagging is proxied, the object version/tags are not available to return
