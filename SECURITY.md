@@ -15,6 +15,15 @@ There is no guaranteed response time, fix schedule or enterprise support SLA.
 The [CI runbook](docs/maintenance/ci.md) records validation boundaries;
 successful local checks do not certify production security.
 
+## Supported platforms
+
+Only Linux builds are in scope for security support, including the published
+`docker.io/neil0628/granary` images for linux/amd64 and linux/arm64. Other
+platforms, such as Windows, can be built from source but are outside security
+support. Storage path confinement does not apply Windows path rules, such as
+`\` separators and UNC paths; see
+[issue #98](https://github.com/relvo-labs/granary/issues/98).
+
 ## Reporting a vulnerability
 
 Report suspected vulnerabilities privately through GitHub private vulnerability
