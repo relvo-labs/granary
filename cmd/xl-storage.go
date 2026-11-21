@@ -3187,16 +3187,63 @@ func (s *xlStorage) ReadParts(ctx context.Context, volume string, partMetaPaths 
 	return parts, nil
 }
 
+// isUnconfinedPathElem reports whether a caller-supplied volume or path
+// element could address something outside its parent directory: it has a
+// "." or ".." segment, or it is absolute.
+func isUnconfinedPathElem(elem string) bool {
+	if hasBadPathComponent(elem) {
+		return true
+	}
+	if strings.HasPrefix(elem, SlashSeparator) || strings.HasPrefix(elem, `\`) {
+		return true
+	}
+	return filepath.IsAbs(elem) || filepath.VolumeName(elem) != ""
+}
+
+// confinedPathJoin joins elems below baseDir and returns err unless every
+// element is confined and the cleaned result is strictly inside baseDir.
+func confinedPathJoin(err error, baseDir string, elems ...string) (string, error) {
+	for _, elem := range elems {
+		if isUnconfinedPathElem(elem) {
+			return "", err
+		}
+	}
+	base := strings.TrimSuffix(pathJoin(baseDir), SlashSeparator)
+	fullPath := pathJoin(append([]string{base}, elems...)...)
+	if !strings.HasPrefix(fullPath, base+SlashSeparator) || len(fullPath) == len(base)+1 {
+		return "", err
+	}
+	return fullPath, nil
+}
+
 // ReadMultiple will read multiple files and send each back as response.
 // Files are read and returned in the given order.
 // The resp channel is closed before the call returns.
-// Only a canceled context will return an error.
+// Only a canceled context or a request whose bucket, prefix or files are not
+// confined to the volume will return an error; nothing is read in the latter
+// case.
 func (s *xlStorage) ReadMultiple(ctx context.Context, req ReadMultipleReq, resp chan<- ReadMultipleResp) error {
 	defer xioutil.SafeClose(resp)
 
-	volumeDir := pathJoin(s.drivePath, req.Bucket)
+	// The request arrives in a storage REST body, which the URL/form checks of
+	// setRequestValidityMiddleware never see, so confine every path here
+	// before reading anything (CVE-2026-42600).
+	if _, err := s.getVolDir(req.Bucket); err != nil {
+		return err
+	}
+	volumeDir, err := confinedPathJoin(errVolumeAccessDenied, s.drivePath, req.Bucket)
+	if err != nil {
+		return err
+	}
+	fullPaths := make([]string, len(req.Files))
+	for i, f := range req.Files {
+		if fullPaths[i], err = confinedPathJoin(errFileAccessDenied, volumeDir, req.Prefix, f); err != nil {
+			return err
+		}
+	}
+
 	found := 0
-	for _, f := range req.Files {
+	for i, f := range req.Files {
 		if contextCanceled(ctx) {
 			return ctx.Err()
 		}
@@ -3209,7 +3256,7 @@ func (s *xlStorage) ReadMultiple(ctx context.Context, req ReadMultipleReq, resp 
 		var data []byte
 		var mt time.Time
 
-		fullPath := pathJoin(volumeDir, req.Prefix, f)
+		fullPath := fullPaths[i]
 		w := xioutil.NewDeadlineWorker(globalDriveConfig.GetMaxTimeout())
 		if err := w.Run(func() (err error) {
 			if req.MetadataOnly {
