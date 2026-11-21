@@ -36,7 +36,9 @@ import (
 	"github.com/minio/pkg/v3/policy"
 	"github.com/minio/pkg/v3/wildcard"
 	"github.com/relvo-labs/granary/internal/auth"
+	xldap "github.com/relvo-labs/granary/internal/config/identity/ldap"
 	"github.com/relvo-labs/granary/internal/config/identity/openid"
+	"github.com/relvo-labs/granary/internal/handlers"
 	"github.com/relvo-labs/granary/internal/hash/sha256"
 	xhttp "github.com/relvo-labs/granary/internal/http"
 	"github.com/relvo-labs/granary/internal/logger"
@@ -92,6 +94,10 @@ const (
 	// maximum supported STS session policy size
 	maxSTSSessionPolicySize = 2048
 )
+
+// errLDAPInvalidCredentials is the only failure detail an LDAP STS client
+// receives for an unknown account, a wrong password or a disabled account.
+var errLDAPInvalidCredentials = errors.New("LDAP authentication failed: invalid username or password")
 
 type stsClaims map[string]any
 
@@ -690,10 +696,32 @@ func (sts *stsAPIHandlers) AssumeRoleWithLDAPIdentity(w http.ResponseWriter, r *
 		return
 	}
 
+	// Refuse further guesses once a username or source address has too many
+	// recent failures. The decision depends only on the submitted username
+	// and address, never on whether the account exists, and is taken before
+	// contacting LDAP so that a correct password cannot be confirmed while
+	// throttled.
+	ldapLimiter := globalIAMSys.LDAPConfig.LoginLimiter()
+	sourceIP := handlers.GetSourceIPRaw(r)
+	if !ldapLimiter.Reserve(ldapUsername, sourceIP) {
+		writeSTSErrorResponse(ctx, w, ErrSTSTooManyRequests, nil)
+		return
+	}
+
 	lookupResult, groupDistNames, err := globalIAMSys.LDAPConfig.Bind(ldapUsername, ldapPassword)
+	ldapLimiter.Finish(ldapUsername, sourceIP, errors.Is(err, xldap.ErrInvalidCredentials))
 	if err != nil {
-		err = fmt.Errorf("LDAP server error: %w", err)
-		writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue, err)
+		if errors.Is(err, xldap.ErrInvalidCredentials) {
+			// Unknown account, wrong password and disabled account all
+			// look the same to the client; only the server log says which.
+			stsLogIf(ctx, fmt.Errorf("LDAP login failed for username %q from %s: %w", ldapUsername, sourceIP, err), logger.InfoKind)
+			writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue, errLDAPInvalidCredentials)
+			return
+		}
+		// The directory could not be queried. The detail stays in the
+		// server log because it may name the user's DN.
+		stsLogIf(ctx, fmt.Errorf("LDAP server error: %w", err), logger.ErrorKind)
+		writeSTSErrorResponse(ctx, w, ErrSTSUpstreamError, nil)
 		return
 	}
 	ldapUserDN := lookupResult.NormDN

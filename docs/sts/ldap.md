@@ -46,6 +46,9 @@ MINIO_IDENTITY_LDAP_GROUP_SEARCH_BASE_DN    (list)      ";" separated list of gr
 MINIO_IDENTITY_LDAP_TLS_SKIP_VERIFY         (on|off)    trust server TLS without verification (default: 'off')
 MINIO_IDENTITY_LDAP_SERVER_INSECURE         (on|off)    allow plain text connection to AD/LDAP server (default: 'off')
 MINIO_IDENTITY_LDAP_SERVER_STARTTLS         (on|off)    use StartTLS connection to AD/LDAP server (default: 'off')
+MINIO_IDENTITY_LDAP_LOGIN_FAILURE_USER_LIMIT (number)   failed LDAP logins per username within login_failure_window before further attempts for that username are refused, 0 disables (default: '10')
+MINIO_IDENTITY_LDAP_LOGIN_FAILURE_IP_LIMIT   (number)   failed LDAP logins per source IP within login_failure_window before further attempts from that IP are refused, 0 disables (default: '50')
+MINIO_IDENTITY_LDAP_LOGIN_FAILURE_WINDOW     (duration) window, starting at the first failure, over which failed LDAP logins are counted and refused once a limit is reached (default: '15m0s')
 MINIO_IDENTITY_LDAP_COMMENT                 (sentence)  optionally add a comment to this setting
 ```
 
@@ -144,6 +147,26 @@ export MINIO_IDENTITY_LDAP_USER_DN_SEARCH_BASE_DN='ou=hwengg,dc=min,dc=io'
 export MINIO_IDENTITY_LDAP_USER_DN_SEARCH_FILTER='(uid=%s)'
 export MINIO_IDENTITY_LDAP_TLS_SKIP_VERIFY=on
 ```
+
+### Failed login throttling
+
+`AssumeRoleWithLDAPIdentity` counts failed logins per username and per source IP address. A login fails when the username is unknown, the password is wrong, or the directory refuses the bind (for example a disabled or locked account). All of these return the same `InvalidParameterValue` error and message, so the response does not reveal whether an account exists; the reason is only written to the server log (never the password).
+
+Once a username or a source IP reaches its limit within the window, further attempts for it are refused with HTTP 429 and error code `Throttling` until the window that started with the first failure ends. This applies to correct passwords too, so a throttled response never confirms a guess, and it applies identically to unknown usernames. Successful logins are never counted. Failures to reach or query the directory before the password is checked are reported as `InternalError` and are not counted.
+
+| Variable                                       | Default | Meaning                                         |
+|------------------------------------------------|---------|-------------------------------------------------|
+| `MINIO_IDENTITY_LDAP_LOGIN_FAILURE_USER_LIMIT` | `10`    | failures per username per window, `0` disables  |
+| `MINIO_IDENTITY_LDAP_LOGIN_FAILURE_IP_LIMIT`   | `50`    | failures per source IP per window, `0` disables |
+| `MINIO_IDENTITY_LDAP_LOGIN_FAILURE_WINDOW`     | `15m`   | counting and refusal window (Go duration)       |
+
+The same settings are available as `login_failure_user_limit`, `login_failure_ip_limit` and `login_failure_window` in the `identity_ldap` configuration subsystem. Notes:
+
+- Counters are kept in memory on each server and reset on restart, so in a cluster the effective limit is per node. At most 10000 usernames and 10000 addresses are tracked; when full, expired entries and then the oldest entries are dropped.
+- Attempts still in progress count against the limits, so a burst of concurrent guesses cannot exceed them; a successful attempt releases its slot when it completes. Many simultaneous logins for one username can therefore briefly receive `Throttling` and should be retried.
+- Usernames are compared case-insensitively after trimming surrounding spaces.
+- The source IP is taken from `X-Forwarded-For`, `X-Real-IP` or `Forwarded` when present, as for the rest of the server. If the server is reachable without a trusted proxy that overwrites these headers, clients can choose their apparent address and the per-IP limit can be bypassed; the per-username limit still applies. Behind a proxy that does not forward the client address, all clients share the proxy's address.
+- An attacker can deliberately lock a known username for the window. Prefer a higher username limit over disabling it, and keep using lockout policies on the directory itself where available.
 
 ### Variable substitution in configuration strings
 

@@ -1,0 +1,199 @@
+// Copyright (c) 2015-2026 MinIO, Inc.
+//
+// This file is part of MinIO Object Storage stack
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+package cmd
+
+import (
+	"context"
+	"encoding/xml"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/minio/madmin-go/v3"
+)
+
+// ldapSTSResult is the externally observable outcome of an
+// AssumeRoleWithLDAPIdentity call, without per-request identifiers.
+type ldapSTSResult struct {
+	Status  int
+	Code    string
+	Message string
+}
+
+func (s *TestSuiteIAM) postLDAPSTS(c *check, username, password string) ldapSTSResult {
+	c.Helper()
+	form := url.Values{}
+	form.Set("Action", ldapIdentity)
+	form.Set("Version", stsAPIVersion)
+	form.Set(stsLDAPUsername, username)
+	form.Set(stsLDAPPassword, password)
+
+	req, err := http.NewRequest(http.MethodPost, s.endPoint+SlashSeparator, strings.NewReader(form.Encode()))
+	if err != nil {
+		c.Fatalf("unable to create STS request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := s.TestSuiteCommon.client.Do(req)
+	if err != nil {
+		c.Fatalf("STS request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		c.Fatalf("unable to read STS response: %v", err)
+	}
+	res := ldapSTSResult{Status: resp.StatusCode}
+	if resp.StatusCode == http.StatusOK {
+		return res
+	}
+	var stsErr STSErrorResponse
+	if err := xml.Unmarshal(body, &stsErr); err != nil {
+		c.Fatalf("unable to parse STS error response %q: %v", string(body), err)
+	}
+	res.Code = stsErr.Error.Code
+	res.Message = stsErr.Error.Message
+	return res
+}
+
+const (
+	testLDAPFailureUserLimit = 3
+	testLDAPFailureWindow    = 3 * time.Second
+)
+
+// TestIAMWithLDAPAuthFailureServerSuite checks that LDAP STS logins do not
+// reveal whether an account exists and that repeated failures are throttled
+// (CVE-2026-33419 / GHSA-jv87-32hw-hh99). It needs a test LDAP server.
+func TestIAMWithLDAPAuthFailureServerSuite(t *testing.T) {
+	ldapServer := os.Getenv(EnvTestLDAPServer)
+	if ldapServer == "" {
+		t.Skipf("Skipping LDAP test as no LDAP server is provided via %s", EnvTestLDAPServer)
+	}
+	for i, testCase := range iamTestSuites {
+		t.Run(
+			fmt.Sprintf("Test: %d, ServerType: %s", i+1, testCase.ServerTypeDescription),
+			func(t *testing.T) {
+				c := &check{t, testCase.serverType}
+				suite := testCase
+
+				suite.SetUpSuite(c)
+				suite.SetUpLDAP(c, ldapServer)
+				suite.TestLDAPSTSAuthFailures(c)
+				suite.TearDownSuite(c)
+			},
+		)
+	}
+}
+
+func (s *TestSuiteIAM) TestLDAPSTSAuthFailures(c *check) {
+	ctx, cancel := context.WithTimeout(context.Background(), testDefaultTimeout)
+	defer cancel()
+
+	const (
+		validUser   = "dillon"
+		validPass   = "dillon"
+		missingUser = "nosuchuser-gx71"
+	)
+
+	// A policy is needed for the valid user, so that a correct password
+	// actually yields credentials.
+	userReq := madmin.PolicyAssociationReq{
+		Policies: []string{"readwrite"},
+		User:     "uid=dillon,ou=people,ou=swengg,dc=min,dc=io",
+	}
+	if _, err := s.adm.AttachPolicyLDAP(ctx, userReq); err != nil {
+		c.Fatalf("Unable to attach user policy: %v", err)
+	}
+	defer func() {
+		if _, err := s.adm.DetachPolicyLDAP(ctx, userReq); err != nil {
+			c.Fatalf("Unable to detach user policy: %v", err)
+		}
+	}()
+
+	// 1. An unknown account and a wrong password are indistinguishable.
+	missing := s.postLDAPSTS(c, missingUser, "wrong-password")
+	wrongPass := s.postLDAPSTS(c, validUser, "wrong-password")
+	if missing.Status == http.StatusOK || wrongPass.Status == http.StatusOK {
+		c.Fatalf("expected failed logins, got %+v and %+v", missing, wrongPass)
+	}
+	if missing != wrongPass {
+		c.Fatalf("unknown user and wrong password responses differ:\n unknown user:   %+v\n wrong password: %+v", missing, wrongPass)
+	}
+	for _, leak := range []string{validUser, missingUser, "DN", "uid="} {
+		if strings.Contains(missing.Message, leak) {
+			c.Fatalf("failure message %q leaks %q", missing.Message, leak)
+		}
+	}
+
+	// Lower the throttling limits so that they can be exercised quickly. The
+	// restart also starts with fresh counters.
+	_, err := s.adm.SetConfigKV(ctx, fmt.Sprintf(
+		"identity_ldap login_failure_user_limit=%d login_failure_ip_limit=1000 login_failure_window=%s",
+		testLDAPFailureUserLimit, testLDAPFailureWindow))
+	if err != nil {
+		c.Fatalf("unable to configure LDAP login throttling: %v", err)
+	}
+	s.RestartIAMSuite(c)
+
+	// The configuration change keeps the uniform failure response.
+	if r := s.postLDAPSTS(c, validUser, "wrong-password"); r != wrongPass {
+		c.Fatalf("unexpected response after reconfiguration: %+v", r)
+	}
+	if r := s.postLDAPSTS(c, missingUser, "wrong-password"); r != wrongPass {
+		c.Fatalf("unexpected response after reconfiguration: %+v", r)
+	}
+
+	// 2. Successful logins are never counted as failures.
+	for i := range testLDAPFailureUserLimit + 1 {
+		if r := s.postLDAPSTS(c, validUser, validPass); r.Status != http.StatusOK {
+			c.Fatalf("successful login %d unexpectedly failed: %+v", i+1, r)
+		}
+	}
+
+	// 3. Reach the per-user failure limit for both accounts (one failure
+	// each was already recorded since the restart).
+	for range testLDAPFailureUserLimit - 1 {
+		if r := s.postLDAPSTS(c, validUser, "wrong-password"); r != wrongPass {
+			c.Fatalf("unexpected response before limit: %+v", r)
+		}
+		if r := s.postLDAPSTS(c, missingUser, "wrong-password"); r != wrongPass {
+			c.Fatalf("unexpected response before limit: %+v", r)
+		}
+	}
+
+	// 4. Once throttled, even the correct password is refused, and the
+	// throttled response is identical for known and unknown accounts.
+	throttledValid := s.postLDAPSTS(c, validUser, validPass)
+	throttledMissing := s.postLDAPSTS(c, missingUser, "wrong-password")
+	if throttledValid.Status != http.StatusTooManyRequests {
+		c.Fatalf("expected throttled login, got %+v", throttledValid)
+	}
+	if throttledValid != throttledMissing {
+		c.Fatalf("throttled responses differ:\n known user:   %+v\n unknown user: %+v", throttledValid, throttledMissing)
+	}
+
+	// 5. Throttling expires with the configured window.
+	time.Sleep(testLDAPFailureWindow + 500*time.Millisecond)
+	if r := s.postLDAPSTS(c, validUser, validPass); r.Status != http.StatusOK {
+		c.Fatalf("expected login to succeed after throttling window, got %+v", r)
+	}
+}

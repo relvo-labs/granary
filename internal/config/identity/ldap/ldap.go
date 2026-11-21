@@ -18,6 +18,8 @@
 package ldap
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strconv"
@@ -227,8 +229,51 @@ func (l *Config) GetValidatedDNWithGroups(username string) (*xldap.DNSearchResul
 	return lookupRes, groups, nil
 }
 
+// ErrInvalidCredentials is wrapped by the error Bind returns when the username
+// does not identify an account or the LDAP server refuses the password.
+// Callers must report both cases identically to the client, so that login
+// responses cannot be used to enumerate accounts; the wrapped detail is only
+// meant for server logs and never contains the password.
+var ErrInvalidCredentials = errors.New("invalid LDAP credentials")
+
+// isLDAPServerError reports whether err means the directory could not answer
+// the user lookup at all, as opposed to the user not being found. Such errors
+// do not depend on the username and are not counted as failed logins.
+func isLDAPServerError(err error) bool {
+	return ldap.IsErrorAnyOf(err,
+		ldap.ErrorNetwork,
+		ldap.LDAPResultNoSuchObject, // configured base DN is gone
+		ldap.LDAPResultBusy,
+		ldap.LDAPResultUnavailable,
+		ldap.LDAPResultTimeLimitExceeded,
+		ldap.LDAPResultAdminLimitExceeded,
+		ldap.LDAPResultUnwillingToPerform,
+		ldap.LDAPResultOperationsError,
+		ldap.LDAPResultOther,
+	)
+}
+
+// decoyBind performs a bind that is certain to fail, against a random entry
+// under the first user search base DN. It is used for unknown usernames so
+// that they incur the same LDAP round trips as a wrong password for a known
+// user. The result is ignored, and conn is closed by the caller right after.
+func (l *Config) decoyBind(conn *ldap.Conn, password string) {
+	bases := l.LDAP.GetUserDNSearchBaseDistNames()
+	if len(bases) == 0 || password == "" {
+		return
+	}
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return
+	}
+	dn := fmt.Sprintf("cn=%s,%s", hex.EncodeToString(nonce[:]), bases[0].ServerDN)
+	_ = conn.Bind(dn, password)
+}
+
 // Bind - binds to ldap, searches LDAP and returns the distinguished name of the
-// user and the list of groups.
+// user and the list of groups. Authentication failures wrap
+// ErrInvalidCredentials; any other error means the directory could not be
+// queried.
 func (l *Config) Bind(username, password string) (*xldap.DNSearchResult, []string, error) {
 	conn, err := l.LDAP.Connect()
 	if err != nil {
@@ -244,15 +289,21 @@ func (l *Config) Bind(username, password string) (*xldap.DNSearchResult, []strin
 	// Lookup user DN
 	lookupResult, err := l.LDAP.LookupUsername(conn, username)
 	if err != nil {
-		errRet := fmt.Errorf("Unable to find user DN: %w", err)
-		return nil, nil, errRet
+		if isLDAPServerError(err) {
+			return nil, nil, fmt.Errorf("Unable to find user DN: %w", err)
+		}
+		// Spend the same bind round trip that a known account costs, so
+		// that the response time does not reveal whether it exists.
+		l.decoyBind(conn, password)
+		return nil, nil, fmt.Errorf("%w: unable to find user DN: %w", ErrInvalidCredentials, err)
 	}
 
-	// Authenticate the user credentials.
+	// Authenticate the user credentials. Every rejection (wrong password,
+	// disabled or locked account, password policy) is reported the same
+	// way as an unknown account.
 	err = conn.Bind(lookupResult.ActualDN, password)
 	if err != nil {
-		errRet := fmt.Errorf("LDAP auth failed for DN %s: %w", lookupResult.ActualDN, err)
-		return nil, nil, errRet
+		return nil, nil, fmt.Errorf("%w: LDAP auth failed for DN %s: %w", ErrInvalidCredentials, lookupResult.ActualDN, err)
 	}
 
 	// Bind to the lookup user account again to perform group search.

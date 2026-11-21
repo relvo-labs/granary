@@ -103,6 +103,24 @@ var (
 			Type:        "on|off",
 		},
 		config.HelpKV{
+			Key:         LoginFailureUserLimit,
+			Description: `failed LDAP logins per username within login_failure_window before further attempts for that username are refused, 0 disables` + defaultHelpPostfix(LoginFailureUserLimit),
+			Optional:    true,
+			Type:        "number",
+		},
+		config.HelpKV{
+			Key:         LoginFailureIPLimit,
+			Description: `failed LDAP logins per source IP within login_failure_window before further attempts from that IP are refused, 0 disables` + defaultHelpPostfix(LoginFailureIPLimit),
+			Optional:    true,
+			Type:        "number",
+		},
+		config.HelpKV{
+			Key:         LoginFailureWindow,
+			Description: `window, starting at the first failure, over which failed LDAP logins are counted and refused once a limit is reached` + defaultHelpPostfix(LoginFailureWindow),
+			Optional:    true,
+			Type:        "duration",
+		},
+		config.HelpKV{
 			Key:         config.Comment,
 			Description: config.DefaultComment,
 			Optional:    true,
