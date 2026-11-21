@@ -27,7 +27,10 @@ land on `master` and has not been verified here.
 `make ci-build` produces `./granary`; `make install` copies it to
 `$(go env GOPATH)/bin/granary`. Verify with `./granary --version` and
 `./granary --help`. No `minio` compatibility executable is installed.
-The root Dockerfile builds the same source; Granary images are not yet published.
+The root Dockerfile builds the same source. The public
+`docker.io/neil0628/granary:v2026.11.14` image supports linux/amd64 and
+linux/arm64; see the [release record](docs/maintenance/release.md#published-releases)
+for its source commit and digests.
 Self-update is disabled; rebuild or install a qualified Granary release manually.
 
 ### Create your feature branch

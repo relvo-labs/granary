@@ -49,6 +49,13 @@ Go: every job uses `actions/setup-go` with `go-version-file: go.mod`, which
 selects the `toolchain go1.27.4` directive, and `make ci-go-version` fails if the
 active Go differs.
 
+The root `go 1.26.0` directive declares **language compatibility**, not the
+minimum patched compiler. For GO-2026-6859, local Make build entries and
+`buildscripts/checkdeps.sh` require a stable compiler from Go 1.26.11 onward
+on the 1.26 line, Go 1.27.4 onward on the 1.27 line, or a newer minor version.
+Older, unrecognized, prerelease and development compilers fail before
+compilation. CI still requires the exact `toolchain` pin from `go.mod`.
+
 Actions are pinned to the commit of a release tag. The SHAs come from
 `git ls-remote --tags` of each canonical repository; the tags are each
 repository's latest GitHub release.
@@ -138,7 +145,15 @@ run them only on a disposable runner or with a scratch `GOPATH`.
 
 The root module and linker symbol prefix are `github.com/relvo-labs/granary`.
 Independent modules under `docs/debugging` retain their inherited module paths
-and Go pins because they do not import the root module (#27).
+and language versions; their toolchain directives follow the root module's
+`go1.27.4` pin (#27). Their dependencies are unchanged. The helper build loop
+stops at the first failed build and returns its exit status (#14).
+
+`make build`, `make install-race` and `make docker` require successful linker
+flag generation and nonempty `Version`, `CommitID` and `ReleaseTag` assignments
+before compiling anything, including debugging helpers under `make -j` (#38).
+Invalid `MINIO_RELEASE`/`MINIO_HOTFIX` values therefore fail the build. Flags
+are generated once on demand, so unrelated Make targets need no version stamp.
 
 `ci-build` produces `./granary` and then fails unless the `(commit-id=...)`
 field of `./granary --version` is exactly the full `git rev-parse HEAD` commit
@@ -173,12 +188,16 @@ comment. The digests were read on 2026-11-14 with anonymous
 | `golang:1.27.4-bookworm` | `sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea` |
 | `debian:bookworm-slim` | `sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc` |
 
-`ci-helm-lint` uses `helm/granary`; its server image tag `unpublished` is a
-placeholder because the Docker Hub `docker.io/neil0628/granary` image is not
-yet published. The [release runbook](release.md) describes host-local
-publishing and the manual dry-run workflow; neither has publication authority.
-Provisioning jobs retain the separate upstream `mc` client image. Self-update and upstream update
-notifications are disabled; install replacement Granary builds manually.
+`ci-helm-lint` uses `helm/granary`; its server image tag is `v2026.11.14`
+from the public Docker Hub `docker.io/neil0628/granary` repository. See the
+[published release record](release.md#published-releases) for digests and source
+identity. The [release runbook](release.md) describes host-local publishing
+and the manual dry-run workflow; neither has publication authority.
+Post-install bucket/user/policy jobs retain the separate upstream
+`quay.io/minio/mc` client image, which is unavailable
+([#33](https://github.com/relvo-labs/granary/issues/33)); passing lint does not
+qualify chart provisioning. Self-update and upstream update notifications are
+disabled; install replacement Granary builds manually.
 
 The single root Dockerfile replaces `Dockerfile.release`,
 `Dockerfile.release.old_cpu`, `Dockerfile.hotfix`, `Dockerfile.cicd` and

@@ -2324,9 +2324,21 @@ func initBackgroundReplication(ctx context.Context, objectAPI ObjectLayer) {
 	go stats.trackEWMA()
 }
 
+// errProxyNoRemoteResult distinguishes unavailable proxy targets from a remote
+// object with an empty tag set. Callers must not authorize using missing results.
+var errProxyNoRemoteResult = errors.New("replication proxy: no remote result")
+
+// proxyTaggingTarget pins the client and bucket used by a successful tag read.
+// A later target configuration change must not redirect the authorized deletion.
+type proxyTaggingTarget struct {
+	client *minio.Client
+	bucket string
+}
+
 type proxyResult struct {
-	Proxy bool
-	Err   error
+	Proxy          bool
+	Err            error
+	taggingTargets []proxyTaggingTarget
 }
 
 // get Reader from replication target if active-active replication is in place and
@@ -2537,10 +2549,11 @@ func proxyTaggingToRepTarget(ctx context.Context, bucket, object string, tags *t
 	// this option is set when active-active replication is in place between site A -> B,
 	// and request hits site B that does not have the object yet.
 	if opts.ProxyRequest || (opts.ProxyHeaderSet && !opts.ProxyRequest) { // true only when site B sets MinIOSourceProxyRequest header
-		return proxy
+		return proxyResult{Err: errProxyNoRemoteResult}
 	}
 	var wg sync.WaitGroup
 	errs := make([]error, len(proxyTargets.Targets))
+	responded := make([]bool, len(proxyTargets.Targets))
 	for idx, t := range proxyTargets.Targets {
 		tgt := globalBucketTargetSys.GetRemoteTargetClient(bucket, t.Arn)
 		if tgt == nil || globalBucketTargetSys.isOffline(tgt.EndpointURL()) {
@@ -2572,9 +2585,8 @@ func proxyTaggingToRepTarget(ctx context.Context, bucket, object string, tags *t
 				}
 				err = tgt.RemoveObjectTagging(ctx, tgt.Bucket, object, dopts)
 			}
-			if err != nil {
-				errs[idx] = err
-			}
+			errs[idx] = err
+			responded[idx] = err == nil
 		}(idx, tgt)
 	}
 	wg.Wait()
@@ -2583,8 +2595,8 @@ func proxyTaggingToRepTarget(ctx context.Context, bucket, object string, tags *t
 		terr        error
 		taggedCount int
 	)
-	for _, err := range errs {
-		if err == nil {
+	for idx, err := range errs {
+		if responded[idx] {
 			taggedCount++
 			continue
 		}
@@ -2593,10 +2605,53 @@ func proxyTaggingToRepTarget(ctx context.Context, bucket, object string, tags *t
 		}
 	}
 	// don't return error if at least one target was tagged successfully
-	if taggedCount == 0 && terr != nil {
+	if taggedCount == 0 {
+		if terr == nil {
+			terr = errProxyNoRemoteResult
+		}
 		proxy.Err = terr
 	}
+	proxy.Proxy = taggedCount > 0
 	return proxy
+}
+
+// proxyDeleteTaggingToRepTarget deletes only from the successful, agreeing tag
+// responders captured before authorization. Unread and not-found targets have no
+// entry in this snapshot, even if they become available before the mutation.
+func proxyDeleteTaggingToRepTarget(ctx context.Context, object string, opts ObjectOptions, targets []proxyTaggingTarget) (proxy proxyResult) {
+	if opts.ProxyRequest || (opts.ProxyHeaderSet && !opts.ProxyRequest) {
+		return proxyResult{Err: errProxyNoRemoteResult}
+	}
+	var wg sync.WaitGroup
+	errs := make([]error, len(targets))
+	for idx, tgt := range targets {
+		errs[idx] = errProxyNoRemoteResult
+		if globalBucketTargetSys.isOffline(tgt.client.EndpointURL()) {
+			continue
+		}
+		wg.Add(1)
+		go func(idx int, tgt proxyTaggingTarget) {
+			defer wg.Done()
+			errs[idx] = tgt.client.RemoveObjectTagging(ctx, tgt.bucket, object, minio.RemoveObjectTaggingOptions{
+				VersionID: opts.VersionID,
+				Internal: minio.AdvancedObjectTaggingOptions{
+					ReplicationProxyRequest: "true",
+				},
+			})
+		}(idx, tgt)
+	}
+	wg.Wait()
+
+	terr := errProxyNoRemoteResult
+	for _, err := range errs {
+		if err == nil {
+			return proxyResult{Proxy: true}
+		}
+		if !errors.Is(err, errProxyNoRemoteResult) {
+			terr = err
+		}
+	}
+	return proxyResult{Err: terr}
 }
 
 // proxyGetTaggingToRepTarget proxies get tagging requests to remote targets for
@@ -2605,11 +2660,13 @@ func proxyGetTaggingToRepTarget(ctx context.Context, bucket, object string, opts
 	// this option is set when active-active replication is in place between site A -> B,
 	// and request hits site B that does not have the object yet.
 	if opts.ProxyRequest || (opts.ProxyHeaderSet && !opts.ProxyRequest) { // true only when site B sets MinIOSourceProxyRequest header
-		return nil, proxy
+		return nil, proxyResult{Err: errProxyNoRemoteResult}
 	}
 	var wg sync.WaitGroup
 	errs := make([]error, len(proxyTargets.Targets))
-	tagSlc := make([]map[string]string, len(proxyTargets.Targets))
+	responded := make([]bool, len(proxyTargets.Targets))
+	tagSlc := make([]*tags.Tags, len(proxyTargets.Targets))
+	targetSlc := make([]proxyTaggingTarget, len(proxyTargets.Targets))
 	for idx, t := range proxyTargets.Targets {
 		tgt := globalBucketTargetSys.GetRemoteTargetClient(bucket, t.Arn)
 		if tgt == nil || globalBucketTargetSys.isOffline(tgt.EndpointURL()) {
@@ -2619,24 +2676,25 @@ func proxyGetTaggingToRepTarget(ctx context.Context, bucket, object string, opts
 		if tgt.disableProxy {
 			continue
 		}
-		idx := idx
+		snapshot := proxyTaggingTarget{client: tgt.Client, bucket: tgt.Bucket}
 		wg.Add(1)
-		go func(idx int, tgt *TargetClient) {
+		go func(idx int, tgt proxyTaggingTarget) {
 			defer wg.Done()
-			var err error
 			gopts := minio.GetObjectTaggingOptions{
 				VersionID: opts.VersionID,
 				Internal: minio.AdvancedObjectTaggingOptions{
 					ReplicationProxyRequest: "true",
 				},
 			}
-			tgs, err = tgt.GetObjectTagging(ctx, tgt.Bucket, object, gopts)
+			tgs, err := tgt.client.GetObjectTagging(ctx, tgt.bucket, object, gopts)
 			if err != nil {
 				errs[idx] = err
 			} else {
-				tagSlc[idx] = tgs.ToMap()
+				tagSlc[idx] = tgs
+				targetSlc[idx] = tgt
+				responded[idx] = true
 			}
-		}(idx, tgt)
+		}(idx, snapshot)
 	}
 	wg.Wait()
 	for idx, err := range errs {
@@ -2644,12 +2702,23 @@ func proxyGetTaggingToRepTarget(ctx context.Context, bucket, object string, opts
 		if err != nil && errCode != "NoSuchKey" && errCode != "NoSuchVersion" {
 			return nil, proxyResult{Err: err}
 		}
-		if err == nil {
-			tgs, _ = tags.MapToObjectTags(tagSlc[idx])
+		if responded[idx] {
+			// Only successful responders participate in authorization and deletion.
+			// Not-found responses have no object version to mutate.
+			// All successful responders must agree on the policy inputs.
+			if proxy.Proxy && !maps.Equal(tgs.ToMap(), tagSlc[idx].ToMap()) {
+				return nil, proxyResult{Err: PrefixAccessDenied{Bucket: bucket, Object: object}}
+			}
+			tgs = tagSlc[idx]
+			proxy.Proxy = true
+			proxy.taggingTargets = append(proxy.taggingTargets, targetSlc[idx])
 		}
 	}
 	if len(errs) == 1 {
 		proxy.Err = errs[0]
+	}
+	if !proxy.Proxy && proxy.Err == nil {
+		proxy.Err = errProxyNoRemoteResult
 	}
 	return tgs, proxy
 }

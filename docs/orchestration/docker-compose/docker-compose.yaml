@@ -2,9 +2,9 @@ version: '3.7'
 
 # Settings and configurations that are common for all containers
 x-minio-common: &minio-common
-  # Build from the repository root: docker build -t granary-local:dev .
-  # The Granary image is not yet published.
-  image: granary-local:dev
+  # Granary is an unofficial fork derived from MinIO.
+  # Published v2026.11.14; pin the multi-platform index for amd64 and arm64.
+  image: docker.io/neil0628/granary:v2026.11.14@sha256:f3eba4c294bb5a445060f6ff7abb7a13e903cb19e7d54c27ad205fd2fa0052e0
   command: server --console-address ":9001" http://minio{1...4}/data{1...2}
   expose:
     - "9000"

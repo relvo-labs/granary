@@ -63,6 +63,30 @@ export MINIO_SITE_NAME="sfo-rack-1"
 granary server /data
 ```
 
+### Console Content Security Policy
+
+Granary, an unofficial fork derived from MinIO, sends this default
+`Content-Security-Policy` header for its embedded console:
+
+```text
+default-src 'self' 'unsafe-eval' 'unsafe-inline'; script-src 'self' https://unpkg.com;  connect-src 'self' https://unpkg.com; img-src 'self' data: blob:;
+```
+
+Images are allowed from the same origin and from `data:` and `blob:` URLs,
+which support console previews. Remote help images are blocked and may appear
+broken; their links remain available. The script and connection allowances for
+`unpkg.com` remain in place.
+
+Set `MINIO_BROWSER_CONTENT_SECURITY_POLICY` or the stored `browser csp_policy`
+setting to replace the entire default policy. The environment variable takes
+precedence over stored configuration; custom policies do not have the default
+`img-src` directive appended. Restart the server after changing this setting.
+
+Granary exports the selected policy to
+`CONSOLE_SECURE_CONTENT_SECURITY_POLICY`, replacing a directly set value of
+that variable. Use `MINIO_BROWSER_CONTENT_SECURITY_POLICY` to override the
+policy for the embedded console.
+
 ### Storage Class
 
 By default, parity for objects with standard storage class is set to `N/2`, and parity for objects with reduced redundancy storage class objects is set to `2`. Read more about storage class support in MinIO server [here](https://github.com/minio/minio/blob/master/docs/erasure/storage-class/README.md).

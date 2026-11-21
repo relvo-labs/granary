@@ -1,6 +1,8 @@
 PWD := $(shell pwd)
 GOPATH := $(shell go env GOPATH)
-LDFLAGS := $(shell go run buildscripts/gen-ldflags.go)
+# Generate once, only when a stamped build needs flags. $(shell ...) alone
+# discards failure; capture its status before any other shell expansion.
+LDFLAGS = $(eval LDFLAGS := $(shell go run buildscripts/gen-ldflags.go))$(if $(filter 0,$(.SHELLSTATUS)),,$(error version stamping failed))$(LDFLAGS)
 
 GOOS ?= $(shell go env GOOS)
 GOARCH ?= $(shell go env GOARCH)
@@ -30,7 +32,7 @@ getdeps: ## fetch necessary dependencies (pinned, checksum-verified golangci-lin
 	@echo "Installing golangci-lint $(GOLANGCI_LINT_VERSION)"
 	@env bash $(PWD)/buildscripts/ci/install-tools.sh $(CI_TOOLS_DIR) golangci-lint
 
-crosscompile: ## cross compile granary
+crosscompile: checks ## cross compile granary
 	@(env bash $(PWD)/buildscripts/cross-compile.sh)
 
 verifiers: lint check-gen
@@ -178,10 +180,16 @@ verify-healing-inconsistent-versions: install-race ## verify resolving inconsist
 	@echo "Verify resolving inconsistent versions build with race"
 	@(env bash $(PWD)/buildscripts/resolve-right-versions.sh)
 
-build-debugging:
+.PHONY: checks check-build-flags build-debugging build install-race docker crosscompile
+check-build-flags: checks
+	@: $(foreach name,Version CommitID ReleaseTag,$(if $(filter-out github.com/relvo-labs/granary/cmd.$(name)=,$(filter github.com/relvo-labs/granary/cmd.$(name)=%,$(LDFLAGS))),,$(error version stamping produced incomplete flags: missing $(name))))
+
+# This dependency also orders helper compilation after the stamp and compiler
+# checks under make -j, including when build-debugging is requested directly.
+build-debugging: check-build-flags
 	@(env bash $(PWD)/docs/debugging/build.sh)
 
-build: checks build-debugging ## builds granary to $(PWD)
+build: check-build-flags build-debugging ## builds granary to $(PWD)
 	@echo "Building granary binary to './granary'"
 	@CGO_ENABLED=0 GOOS=$(GOOS) GOARCH=$(GOARCH) go build -tags kqueue -trimpath --ldflags "$(LDFLAGS)" -o $(PWD)/granary 1>/dev/null
 
@@ -201,7 +209,7 @@ release-image: ## dry-run both release image platforms; publishing requires the 
 
 # The image is stamped like `make build`: the Dockerfile runs gen-ldflags.go
 # with the same commit, commit time and MINIO_RELEASE/MINIO_HOTFIX inputs.
-docker: checks ## builds granary docker container
+docker: check-build-flags ## builds granary docker container
 	@echo "Building granary docker image '$(TAG)'"
 	@docker build -q --no-cache \
 		--label org.opencontainers.image.licenses=AGPL-3.0-or-later \
@@ -215,7 +223,7 @@ test-resiliency: build
 	@echo "Running resiliency tests"
 	@(DOCKER_COMPOSE_FILE=$(PWD)/docs/resiliency/docker-compose.yaml env bash $(PWD)/docs/resiliency/resiliency-tests.sh)
 
-install-race: checks build-debugging ## builds granary to $(PWD)
+install-race: check-build-flags build-debugging ## builds granary to $(PWD)
 	@echo "Building granary binary with -race to './granary'"
 	@GORACE=history_size=7 CGO_ENABLED=1 go build -tags kqueue,dev -race -trimpath --ldflags "$(LDFLAGS)" -o $(PWD)/granary 1>/dev/null
 	@echo "Installing granary binary with -race to '$(GOPATH)/bin/granary'"

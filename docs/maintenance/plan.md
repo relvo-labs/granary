@@ -1,6 +1,6 @@
 # Unofficial fork maintenance plan
 
-Version: 0.3.1
+Version: 0.3.2
 
 This plan covers the initial maintenance of Granary (`relvo-labs/granary`,
 formerly `relvo-labs/minio`). On 2026-11-14 the owner renamed the fork to
@@ -10,9 +10,11 @@ with Docker Hub `docker.io/neil0628/granary` images. The owner’s later
 2026-11-14 decision in issue #39 supersedes the initial GHCR plan: publishing
 runs on the maintainer host with local buildx for linux/amd64 and linux/arm64;
 Actions performs manual dry-run builds only. Credentials stay on the host,
-with no repository secret. No image has been published yet. Publishing a
-specific release still requires its own qualification and owner go-ahead;
-the first release also requires #25 to be merged. See [release.md](release.md).
+with no repository secret. The public `docker.io/neil0628/granary:v2026.11.14`
+image is published for linux/amd64 and linux/arm64; anonymous read-back on
+2026-11-15 confirmed `:latest` points to the same index. No git tag or GitHub
+Release was created. Future releases still require their own qualification
+and owner go-ahead. See [release.md](release.md).
 This plan does not authorize merging pull requests, deploying services, or
 changing production data.
 

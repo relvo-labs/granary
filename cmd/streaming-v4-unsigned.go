@@ -89,8 +89,8 @@ func (cr *s3UnsignedChunkedReader) Read(buf []byte) (n int, err error) {
 	mustRead := func(b ...byte) error {
 		for _, want := range b {
 			got, err := cr.reader.ReadByte()
-			if err == io.EOF {
-				return io.ErrUnexpectedEOF
+			if err != nil {
+				return streamingReadError(err)
 			}
 			if got != want {
 				if cr.debug {
@@ -98,20 +98,14 @@ func (cr *s3UnsignedChunkedReader) Read(buf []byte) (n int, err error) {
 				}
 				return errMalformedEncoding
 			}
-			if err != nil {
-				return err
-			}
 		}
 		return nil
 	}
 	var size int
 	for {
 		b, err := cr.reader.ReadByte()
-		if err == io.EOF {
-			err = io.ErrUnexpectedEOF
-		}
 		if err != nil {
-			cr.err = err
+			cr.err = streamingReadError(err)
 			return n, cr.err
 		}
 		if b == '\r' { // \r\n denotes end of size.
@@ -155,11 +149,8 @@ func (cr *s3UnsignedChunkedReader) Read(buf []byte) (n int, err error) {
 
 	// Now, we read the payload.
 	_, err = io.ReadFull(cr.reader, cr.buffer)
-	if err == io.EOF && size != 0 {
-		err = io.ErrUnexpectedEOF
-	}
-	if err != nil && err != io.EOF {
-		cr.err = err
+	if err != nil {
+		cr.err = streamingReadError(err)
 		return n, cr.err
 	}
 
@@ -184,7 +175,7 @@ func (cr *s3UnsignedChunkedReader) Read(buf []byte) (n int, err error) {
 	}
 	// read final terminator.
 	err = mustRead('\r', '\n')
-	if err != nil && err != io.EOF {
+	if err != nil {
 		cr.err = err
 		return n, cr.err
 	}
@@ -201,9 +192,7 @@ func (cr *s3UnsignedChunkedReader) readTrailers() error {
 	for {
 		v, err := cr.reader.ReadByte()
 		if err != nil {
-			if err == io.EOF {
-				return io.ErrUnexpectedEOF
-			}
+			return streamingReadError(err)
 		}
 		if v != '\r' {
 			valueBuffer.WriteByte(v)
@@ -213,9 +202,7 @@ func (cr *s3UnsignedChunkedReader) readTrailers() error {
 		var tmp [3]byte
 		_, err = io.ReadFull(cr.reader, tmp[:])
 		if err != nil {
-			if err == io.EOF {
-				return io.ErrUnexpectedEOF
-			}
+			return streamingReadError(err)
 		}
 		if !bytes.Equal(tmp[:], []byte{'\n', '\r', '\n'}) {
 			if cr.debug {
@@ -259,7 +246,7 @@ func (cr *s3UnsignedChunkedReader) readTrailers() error {
 
 	// Check if we got all we want.
 	if len(wantTrailers) > 0 {
-		return io.ErrUnexpectedEOF
+		return IncompleteBody{}
 	}
 	return nil
 }

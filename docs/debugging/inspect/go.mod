@@ -2,7 +2,7 @@ module github.com/minio/minio/docs/debugging/inspect
 
 go 1.23.0
 
-toolchain go1.24.8
+toolchain go1.27.4
 
 require (
 	github.com/klauspost/compress v1.17.11
