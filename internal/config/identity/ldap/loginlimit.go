@@ -18,7 +18,6 @@
 package ldap
 
 import (
-	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -88,7 +87,7 @@ type loginKey [sha256.Size]byte
 type loginFailure struct {
 	failures int       // failed attempts in the current window
 	pending  int       // attempts reserved but not yet finished
-	start    time.Time // start of the current window (first failure)
+	start    time.Time // start of the current window (see finish)
 }
 
 type loginFailureTable struct {
@@ -102,9 +101,11 @@ type loginFailureTable struct {
 }
 
 // LoginFailureLimiter counts failed login attempts per username and per
-// source IP address within a fixed window that starts at the first failure.
-// Once either count reaches its limit, further attempts for that key are
-// refused until the window ends.
+// source IP address within a fixed window. The window starts when the
+// earliest failed attempt in it was reserved, not when the directory
+// rejected it, so that the moment a key is admitted again does not reveal
+// how long the directory took. Once either count reaches its limit, further
+// attempts for that key are refused until the window ends.
 //
 // Callers Reserve an attempt before checking credentials and complete the
 // returned LoginAttempt afterwards. Attempts in flight count against the
@@ -182,7 +183,8 @@ type LoginAttempt struct {
 	ip     *loginFailure // nil when per-IP throttling does not apply
 	userK  loginKey
 	ipK    loginKey
-	closed bool // guarded by l.mu
+	start  time.Time // when the attempt was reserved
+	closed bool      // guarded by l.mu
 }
 
 // Reserve reports whether a login attempt for username from sourceIP may
@@ -244,12 +246,14 @@ func (l *LoginFailureLimiter) Reserve(username, sourceIP string) (*LoginAttempt,
 		ie.pending++
 		a.ip = ie
 	}
+	a.start = now
 	return a, true
 }
 
 // Finish completes the attempt. A failed attempt is counted against its
-// username and source address; otherwise the reservation is only released.
-// Calls after the first completion are ignored.
+// username and source address as of the time it was reserved; otherwise the
+// reservation is only released. Calls after the first completion are
+// ignored.
 func (a *LoginAttempt) Finish(failed bool) {
 	if a == nil || a.l == nil {
 		return
@@ -263,10 +267,10 @@ func (a *LoginAttempt) Finish(failed bool) {
 	a.closed = true
 	now := l.now()
 	if a.user != nil {
-		l.users.finish(a.userK, a.user, now, l.window, failed)
+		l.users.finish(a.userK, a.user, a.start, now, l.window, failed)
 	}
 	if a.ip != nil {
-		l.ips.finish(a.ipK, a.ip, now, l.window, failed)
+		l.ips.finish(a.ipK, a.ip, a.start, now, l.window, failed)
 	}
 }
 
@@ -362,15 +366,30 @@ func (t *loginFailureTable) hasRoom(now time.Time, window time.Duration, maxEntr
 	return false
 }
 
-func (t *loginFailureTable) finish(key loginKey, e *loginFailure, now time.Time, window time.Duration, failed bool) {
+// finish completes an attempt on e that was reserved at reserved. A failure
+// is placed in time by its reservation, which does not depend on the
+// directory: the window starts at the earliest reservation among its
+// failures. The result therefore does not depend on how long each attempt
+// took or on the order in which concurrent attempts complete, as long as
+// each completes within one window of being reserved.
+func (t *loginFailureTable) finish(key loginKey, e *loginFailure, reserved, now time.Time, window time.Duration, failed bool) {
 	if e.pending > 0 {
 		e.pending--
 	}
 	if failed {
-		if e.failures == 0 || now.Sub(e.start) >= window {
-			e.failures, e.start = 0, now
+		switch {
+		case e.failures == 0 || reserved.Sub(e.start) >= window:
+			// First failure of a new window.
+			e.failures, e.start = 1, reserved
+		case e.start.Sub(reserved) >= window:
+			// Reserved in a window that has already been replaced;
+			// that window's failures no longer count.
+		default:
+			if reserved.Before(e.start) {
+				e.start = reserved
+			}
+			e.failures++
 		}
-		e.failures++
 	}
 	if t.expire(key, e, now, window) {
 		return
@@ -384,17 +403,24 @@ func (t *loginFailureTable) finish(key loginKey, e *loginFailure, now time.Time,
 
 // loginResponseFloor delays rejected logins until a minimum time has passed
 // since the attempt started.
+//
+// The wait deliberately does not end when the client goes away: an HTTP/1
+// client can half-close its connection after sending the request, which
+// cancels the request context while the client can still read the response.
+// Ending the wait then would let the client observe the rejection (or the
+// connection closing) at the directory's own pace. The wait is bounded by
+// min, which configuration limits to MaxLoginFailureMinResponseTime.
 type loginResponseFloor struct {
 	min   time.Duration
 	now   func() time.Time
-	sleep func(ctx context.Context, d time.Duration)
+	sleep func(d time.Duration)
 }
 
 func newLoginResponseFloor(minDuration time.Duration) *loginResponseFloor {
 	if minDuration <= 0 {
 		return nil
 	}
-	return &loginResponseFloor{min: minDuration, now: time.Now, sleep: sleepContext}
+	return &loginResponseFloor{min: minDuration, now: time.Now, sleep: time.Sleep}
 }
 
 func (f *loginResponseFloor) start() time.Time {
@@ -404,22 +430,18 @@ func (f *loginResponseFloor) start() time.Time {
 	return f.now()
 }
 
-// wait blocks until the minimum response time has elapsed since start, or
-// until ctx is done.
-func (f *loginResponseFloor) wait(ctx context.Context, start time.Time) {
+// wait blocks until the minimum response time has elapsed since start. It
+// never blocks for longer than the minimum response time itself, even if
+// the clock moved backwards.
+func (f *loginResponseFloor) wait(start time.Time) {
 	if f == nil {
 		return
 	}
-	if d := f.min - f.now().Sub(start); d > 0 {
-		f.sleep(ctx, d)
+	d := f.min - f.now().Sub(start)
+	if d > f.min {
+		d = f.min
 	}
-}
-
-func sleepContext(ctx context.Context, d time.Duration) {
-	t := time.NewTimer(d)
-	defer t.Stop()
-	select {
-	case <-t.C:
-	case <-ctx.Done():
+	if d > 0 {
+		f.sleep(d)
 	}
 }

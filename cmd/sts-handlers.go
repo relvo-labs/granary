@@ -715,7 +715,13 @@ func (sts *stsAPIHandlers) AssumeRoleWithLDAPIdentity(w http.ResponseWriter, r *
 			if len(logUser) > xldap.MaxLoginUsernameLength {
 				logUser = logUser[:xldap.MaxLoginUsernameLength] + "..."
 			}
-			stsLogIf(ctx, fmt.Errorf("LDAP login failed for username %q from %s: %w", logUser, sourceIP, err), logger.InfoKind)
+			// An unusable lookup result (e.g. several entries for one
+			// name) is a directory configuration problem worth an error.
+			logKind := logger.InfoKind
+			if errors.Is(err, xldap.ErrUnusableAccount) {
+				logKind = logger.ErrorKind
+			}
+			stsLogIf(ctx, fmt.Errorf("LDAP login failed for username %q from %s: %w", logUser, sourceIP, err), logKind)
 			writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue, errLDAPInvalidCredentials)
 		default:
 			// The directory could not be queried. The detail stays in the

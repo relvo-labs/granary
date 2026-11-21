@@ -242,11 +242,22 @@ var ErrInvalidCredentials = errors.New("invalid LDAP credentials")
 // directory is contacted and does not depend on whether the account exists.
 var ErrLoginThrottled = errors.New("too many failed LDAP logins")
 
+// ErrUnusableAccount is wrapped, together with ErrInvalidCredentials, when
+// the user search for a username succeeded but did not yield exactly one
+// usable entry: several entries match (an ambiguous name, or overlapping
+// search bases), or an entry's DN cannot be parsed. Such a username can
+// never log in, and the outcome depends on the directory's entries for it,
+// so the client gets the same response as for any rejected credentials.
+// It is a directory configuration problem rather than a guess, so Login
+// does not count it as a failed attempt.
+var ErrUnusableAccount = errors.New("LDAP user search did not yield exactly one usable entry")
+
 // isUserNotFound reports whether err from LookupUsername means that the
-// search succeeded but matched no entry. Only this outcome is a credential
-// failure; every other lookup error (directory refused or failed the search,
-// several matching entries, malformed DN) is a server-side problem that is
-// reported as such and is not counted against the username.
+// search succeeded but matched no entry. Only this outcome is a counted
+// credential failure. Account-dependent unusable results are recognised by
+// isUnusableAccount; every other lookup error (the directory refused or
+// failed the search) is a server-side problem that is reported as such and
+// is not counted against the username.
 func isUserNotFound(err error) bool {
 	var lerr *ldap.Error
 	if errors.As(err, &lerr) {
@@ -255,6 +266,21 @@ func isUserNotFound(err error) bool {
 	// minio/pkg documents this prefix for the no-match result and returns
 	// it as a plain error, unlike directory errors which are *ldap.Error.
 	return strings.HasPrefix(err.Error(), "User DN not found for:")
+}
+
+// isUnusableAccount reports whether err from LookupUsername means that the
+// search succeeded but its entries for this username are unusable: several
+// entries matched, or an entry's DN could not be parsed. Both outcomes are
+// plain errors with these documented prefixes in minio/pkg; directory
+// errors are returned as *ldap.Error or wrap one under other messages.
+func isUnusableAccount(err error) bool {
+	msg := err.Error()
+	if strings.HasPrefix(msg, "Multiple DNs for ") {
+		var lerr *ldap.Error
+		return !errors.As(err, &lerr)
+	}
+	// NormalizeDN of a returned entry: "DN (<dn>) parse failure: ...".
+	return strings.HasPrefix(msg, "DN (") && strings.Contains(msg, ") parse failure: ")
 }
 
 // decoyBind performs a bind that is certain to fail, against a random entry
@@ -296,13 +322,21 @@ func (l *Config) Bind(username, password string) (*xldap.DNSearchResult, []strin
 	// Lookup user DN
 	lookupResult, err := l.LDAP.LookupUsername(conn, username)
 	if err != nil {
-		if !isUserNotFound(err) {
+		switch {
+		case isUserNotFound(err):
+			// Spend the same bind round trip that a known account
+			// costs, so that the response time does not reveal whether
+			// it exists.
+			l.decoyBind(conn, password)
+			return nil, nil, fmt.Errorf("%w: unable to find user DN: %w", ErrInvalidCredentials, err)
+		case isUnusableAccount(err):
+			// Answered like any rejected credentials, because the
+			// result depends on this username's entries.
+			l.decoyBind(conn, password)
+			return nil, nil, fmt.Errorf("%w: %w: unable to find user DN: %w", ErrInvalidCredentials, ErrUnusableAccount, err)
+		default:
 			return nil, nil, fmt.Errorf("Unable to find user DN: %w", err)
 		}
-		// Spend the same bind round trip that a known account costs, so
-		// that the response time does not reveal whether it exists.
-		l.decoyBind(conn, password)
-		return nil, nil, fmt.Errorf("%w: unable to find user DN: %w", ErrInvalidCredentials, err)
 	}
 
 	// Authenticate the user credentials. Every rejection (wrong password,
@@ -335,20 +369,28 @@ func (l *Config) Bind(username, password string) (*xldap.DNSearchResult, []strin
 //   - Throttled attempts fail with ErrLoginThrottled without contacting the
 //     directory.
 //   - Rejected credentials (unknown account, wrong password, refused bind)
-//     wrap ErrInvalidCredentials and are counted. They return no earlier than
-//     the configured minimum response time after Login was called, so that
-//     the directory's faster rejection of unknown accounts is not visible.
-//     The wait happens after the limiter is updated and without holding its
-//     lock, and ends early when ctx is done.
+//     wrap ErrInvalidCredentials and are counted, as of the time the attempt
+//     was reserved. They return no earlier than the configured minimum
+//     response time after Login was called, so that the directory's faster
+//     rejection of unknown accounts is not visible. The wait happens after
+//     the limiter is updated and without holding its lock.
+//   - A username whose search yields no single usable entry also wraps
+//     ErrInvalidCredentials (and ErrUnusableAccount) and is delayed the same
+//     way, but is not counted; its reservation is held until the delay ends,
+//     so that releasing it does not reveal the directory's timing either.
 //   - Any other error means the directory could not be queried; it is not
 //     counted and not delayed.
+//
+// The delay does not end when ctx is done: a client can cancel the request
+// context by half-closing its connection while still reading the response.
+// The delay is bounded by the configured minimum response time.
 //
 // The reservation is released even if the directory call panics.
 func (l *Config) Login(ctx context.Context, username, password, sourceIP string) (*xldap.DNSearchResult, []string, error) {
 	floor := l.loginFloor
 	start := floor.start()
 	if !ValidLoginCredentialLengths(username, password) {
-		floor.wait(ctx, start)
+		floor.wait(start)
 		return nil, nil, fmt.Errorf("%w: username or password exceeds the length limit", ErrInvalidCredentials)
 	}
 	attempt, ok := l.loginLimiter.Reserve(username, sourceIP)
@@ -363,9 +405,16 @@ func (l *Config) Login(ctx context.Context, username, password, sourceIP string)
 	}
 	lookupResult, groups, err := bind(username, password)
 	invalid := errors.Is(err, ErrInvalidCredentials)
-	attempt.Finish(invalid)
+	switch {
+	case !invalid:
+		attempt.Finish(false)
+	case !errors.Is(err, ErrUnusableAccount):
+		attempt.Finish(true)
+	}
 	if invalid {
-		floor.wait(ctx, start)
+		// An unusable account's reservation is released by the deferred
+		// Abort, after the wait.
+		floor.wait(start)
 	}
 	if err != nil {
 		return nil, nil, err

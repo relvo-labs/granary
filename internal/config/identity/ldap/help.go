@@ -116,7 +116,7 @@ var (
 		},
 		config.HelpKV{
 			Key:         LoginFailureWindow,
-			Description: `window, starting at the first failure, over which failed LDAP logins are counted and refused once a limit is reached` + defaultHelpPostfix(LoginFailureWindow),
+			Description: `window, starting when the first failed attempt began, over which failed LDAP logins are counted and refused once a limit is reached` + defaultHelpPostfix(LoginFailureWindow),
 			Optional:    true,
 			Type:        "duration",
 		},

@@ -46,7 +46,7 @@ func (r *recordingFloor) install(cfg *Config, minDuration time.Duration) {
 			defer r.mu.Unlock()
 			return r.clk.now()
 		},
-		sleep: func(_ context.Context, d time.Duration) {
+		sleep: func(d time.Duration) {
 			r.mu.Lock()
 			r.waits = append(r.waits, d)
 			hook := r.hook
@@ -182,25 +182,21 @@ func TestLoginMinResponseTimeDoesNotHoldLimiter(t *testing.T) {
 	}
 }
 
-// The real wait ends when the request context is cancelled.
-func TestLoginMinResponseTimeHonorsContext(t *testing.T) {
-	d := newFakeDirectory(t, 0)
-	cfg := d.config(t)
-	setLoginMinResponseTime(cfg, MaxLoginFailureMinResponseTime)
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	done := make(chan error, 1)
-	go func() {
-		_, _, err := cfg.Login(ctx, "nosuchuser", "guess", "10.0.0.1")
-		done <- err
-	}()
-	select {
-	case err := <-done:
-		if !errors.Is(err, ErrInvalidCredentials) {
-			t.Fatalf("expected invalid credentials, got %v", err)
-		}
-	case <-time.After(MaxLoginFailureMinResponseTime / 2):
-		t.Fatal("cancelled request still waited for the minimum response time")
+// The wait never exceeds the minimum response time, even if the clock
+// moves backwards while the directory is queried.
+func TestLoginMinResponseTimeBounded(t *testing.T) {
+	var cfg Config
+	rec := &recordingFloor{clk: &fakeClock{t: time.Unix(1_700_000_000, 0)}}
+	rec.install(&cfg, time.Second)
+	cfg.bindFn = func(username, password string) (*xldap.DNSearchResult, []string, error) {
+		rec.mu.Lock()
+		rec.clk.advance(-time.Hour)
+		rec.mu.Unlock()
+		return nil, nil, ErrInvalidCredentials
+	}
+	_, _, _ = cfg.Login(context.Background(), "alice", "guess", "10.0.0.1")
+	if w := rec.take(); len(w) != 1 || w[0] != time.Second {
+		t.Fatalf("expected one wait of at most 1s, got %v", w)
 	}
 }
 

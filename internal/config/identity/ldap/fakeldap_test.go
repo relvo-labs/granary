@@ -45,6 +45,7 @@ type fakeDirectory struct {
 	mu        sync.Mutex
 	users     map[string]fakeUser // uid -> account
 	searchErr map[string]uint16   // uid -> result code of the user search
+	searchDNs map[string][]string // uid -> entries returned by the user search, overriding users
 
 	conns atomic.Int64 // connections accepted
 
@@ -76,6 +77,7 @@ func newFakeDirectory(t *testing.T, passwordCost time.Duration) *fakeDirectory {
 		passwordCost: passwordCost,
 		users:        map[string]fakeUser{},
 		searchErr:    map[string]uint16{},
+		searchDNs:    map[string][]string{},
 		ln:           ln,
 	}
 	d.wg.Add(1)
@@ -97,6 +99,14 @@ func (d *fakeDirectory) failSearch(uid string, code uint16) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.searchErr[uid] = code
+}
+
+// returnEntries makes the user search for uid return entries with the given
+// DNs, e.g. several entries (an ambiguous name) or a malformed DN.
+func (d *fakeDirectory) returnEntries(uid string, dns ...string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.searchDNs[uid] = dns
 }
 
 func (d *fakeDirectory) userDN(uid string) string { return "uid=" + uid + "," + d.baseDN }
@@ -219,9 +229,17 @@ func (d *fakeDirectory) search(msgID int64, op *ber.Packet) []*ber.Packet {
 	d.mu.Lock()
 	code, failing := d.searchErr[uid]
 	_, exists := d.users[uid]
+	dns, override := d.searchDNs[uid]
 	d.mu.Unlock()
 	if failing {
 		return []*ber.Packet{done(code)}
+	}
+	if override {
+		out := make([]*ber.Packet, 0, len(dns)+1)
+		for _, dn := range dns {
+			out = append(out, searchEntry(msgID, dn))
+		}
+		return append(out, done(ldap.LDAPResultSuccess))
 	}
 	if exists {
 		return []*ber.Packet{searchEntry(msgID, d.userDN(uid)), done(ldap.LDAPResultSuccess)}

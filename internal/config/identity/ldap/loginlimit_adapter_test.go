@@ -64,3 +64,18 @@ func setLoginMinResponseTime(cfg *Config, d time.Duration) {
 func setLoginLimiter(cfg *Config, l *LoginFailureLimiter) {
 	cfg.loginLimiter = l
 }
+
+// setLoginFakeClock makes cfg use l as its limiter and both of them use clk.
+// Rejections wait for minDuration; each wait is passed to onWait instead of
+// sleeping.
+func setLoginFakeClock(cfg *Config, l *LoginFailureLimiter, clk *fakeClock, minDuration time.Duration, onWait func(time.Duration)) {
+	l.now = clk.now
+	cfg.loginLimiter = l
+	cfg.loginFloor = &loginResponseFloor{
+		min: minDuration,
+		now: clk.now,
+		sleep: func(d time.Duration) {
+			onWait(d)
+		},
+	}
+}

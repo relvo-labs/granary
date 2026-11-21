@@ -18,10 +18,13 @@
 package cmd
 
 import (
+	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/xml"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -91,6 +94,62 @@ func (s *TestSuiteIAM) timedPostLDAPSTS(c *check, username, password string) (ld
 	start := time.Now()
 	r := s.postLDAPSTS(c, username, password)
 	return r, time.Since(start)
+}
+
+// halfClosedPostLDAPSTS sends an LDAP STS request over a raw connection,
+// closes the writing side right after the request (which makes the server
+// cancel the request context), and returns the response status and the time
+// until the first observable result: response bytes or connection closure.
+func (s *TestSuiteIAM) halfClosedPostLDAPSTS(c *check, username, password string) (int, time.Duration) {
+	c.Helper()
+	u, err := url.Parse(s.endPoint)
+	if err != nil {
+		c.Fatalf("invalid endpoint %q: %v", s.endPoint, err)
+	}
+	form := url.Values{}
+	form.Set("Action", ldapIdentity)
+	form.Set("Version", stsAPIVersion)
+	form.Set(stsLDAPUsername, username)
+	form.Set(stsLDAPPassword, password)
+	body := form.Encode()
+	req := fmt.Sprintf("POST / HTTP/1.1\r\nHost: %s\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: %d\r\n\r\n%s",
+		u.Host, len(body), body)
+
+	var conn net.Conn
+	var closeWrite func() error
+	if s.secure {
+		tc, err := tls.Dial("tcp", u.Host, &tls.Config{InsecureSkipVerify: true})
+		if err != nil {
+			c.Fatalf("unable to connect: %v", err)
+		}
+		conn, closeWrite = tc, tc.CloseWrite
+	} else {
+		nc, err := net.Dial("tcp", u.Host)
+		if err != nil {
+			c.Fatalf("unable to connect: %v", err)
+		}
+		conn, closeWrite = nc, nc.(*net.TCPConn).CloseWrite
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(testDefaultTimeout))
+	start := time.Now()
+	if _, err := io.WriteString(conn, req); err != nil {
+		c.Fatalf("unable to send STS request: %v", err)
+	}
+	if err := closeWrite(); err != nil {
+		c.Fatalf("unable to half-close the connection: %v", err)
+	}
+	br := bufio.NewReader(conn)
+	if _, err := br.Peek(1); err != nil {
+		return 0, time.Since(start)
+	}
+	took := time.Since(start)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		c.Fatalf("unable to read STS response: %v", err)
+	}
+	resp.Body.Close()
+	return resp.StatusCode, took
 }
 
 // TestIAMWithLDAPAuthFailureServerSuite checks that LDAP STS logins do not
@@ -183,6 +242,15 @@ func (s *TestSuiteIAM) TestLDAPSTSAuthFailures(c *check) {
 		if took < testLDAPMinResponseTime {
 			c.Fatalf("rejection for %q took %v, less than the minimum response time %v", user, took, testLDAPMinResponseTime)
 		}
+	}
+
+	// A client that half-closes its connection after the request makes the
+	// server cancel the request context; the rejection must still not be
+	// observable (as a response or as connection closure) before the
+	// minimum response time. A separate unknown username keeps the
+	// per-user counts below unchanged.
+	if status, took := s.halfClosedPostLDAPSTS(c, "nosuchuser-halfclose", "wrong-password"); took < testLDAPMinResponseTime || status != wrongPass.Status {
+		c.Fatalf("half-closed rejection: status %d after %v, want status %d no earlier than %v", status, took, wrongPass.Status, testLDAPMinResponseTime)
 	}
 
 	// 2. Successful logins are never counted as failures.
