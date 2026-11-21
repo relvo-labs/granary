@@ -215,7 +215,10 @@ func TestContentSHA256ConditionSingleValue(t *testing.T) {
 			}
 			values := getConditionValues(req, "", auth.Credentials{AccessKey: "fixture-user"})
 			name := condition.S3XAmzContentSha256.Name()
-			got := append(values[http.CanonicalHeaderKey(name)], values[name]...)
+			canonical := values[http.CanonicalHeaderKey(name)]
+			got := make([]string, 0, len(canonical)+len(values[name]))
+			got = append(got, canonical...)
+			got = append(got, values[name]...)
 			if fmt.Sprint(got) != fmt.Sprint(tc.want) {
 				t.Errorf("x-amz-content-sha256 = %q, want %q", got, tc.want)
 			}
