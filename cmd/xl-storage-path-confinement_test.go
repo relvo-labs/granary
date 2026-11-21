@@ -27,6 +27,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -539,6 +540,10 @@ func checkPathConfinementAllowsInternalPaths(t *testing.T, disk StorageAPI, loca
 
 	for _, p := range []string{"a..b/c..", ".hidden/x", "dir/sub/file", "dir/trailing/", "...", "a.b"} {
 		if strings.HasSuffix(p, "/") {
+			continue
+		}
+		if p == "..." && runtime.GOOS == globalWindowsOSName {
+			// Win32 resolves a trailing "..." to its parent (issue #82).
 			continue
 		}
 		must("WriteAll "+p, disk.WriteAll(ctx, bkt, p, []byte(p)))
