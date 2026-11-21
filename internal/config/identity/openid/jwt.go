@@ -19,6 +19,8 @@ package openid
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/rsa"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -79,8 +81,11 @@ func (r *Config) PopulatePublicKey(arn arn.ARN) error {
 		return nil
 	}
 
-	// Add client secret for the client ID for HMAC based signature.
-	r.pubKeys.add(pCfg.ClientID, []byte(pCfg.ClientSecret))
+	// Only asymmetric keys published by the provider's JWKS are used to
+	// verify tokens. The client secret must never be registered as an HMAC
+	// verification key: it is shared with relying parties, so anybody who
+	// knows it could otherwise forge tokens for any identity
+	// (CVE-2026-33322 / GHSA-5cx5-wh4m-82fh).
 
 	client := &http.Client{
 		Transport: r.transport,
@@ -132,16 +137,38 @@ const (
 	azpClaim = "azp"
 )
 
+// validSigningMethods lists the only JWT algorithms accepted for OpenID
+// tokens. All are asymmetric; symmetric (HS*) and "none" are never accepted.
+var validSigningMethods = []string{
+	"RS256", "RS384", "RS512",
+	"ES256", "ES384", "ES512",
+	"RS3256", "RS3384", "RS3512",
+	"ES3256", "ES3384", "ES3512",
+}
+
+// verificationKeyFor returns key if it is a valid verification key for the
+// token's signing method, i.e. an RSA public key for RS* and an ECDSA public
+// key for ES*. Any other combination is rejected so that an attacker cannot
+// pick an algorithm that reinterprets a published key.
+func verificationKeyFor(method jwtgo.SigningMethod, key any) (any, error) {
+	switch method.(type) {
+	case *jwtgo.SigningMethodRSA:
+		if k, ok := key.(*rsa.PublicKey); ok {
+			return k, nil
+		}
+	case *jwtgo.SigningMethodECDSA:
+		if k, ok := key.(*ecdsa.PublicKey); ok {
+			return k, nil
+		}
+	default:
+		return nil, fmt.Errorf("unsupported JWT signing algorithm %q", method.Alg())
+	}
+	return nil, fmt.Errorf("JWT signing algorithm %q does not match the key type %T", method.Alg(), key)
+}
+
 // Validate - validates the id_token.
 func (r *Config) Validate(ctx context.Context, arn arn.ARN, token, accessToken, dsecs string, claims map[string]any) error {
-	jp := new(jwtgo.Parser)
-	jp.ValidMethods = []string{
-		"RS256", "RS384", "RS512",
-		"ES256", "ES384", "ES512",
-		"HS256", "HS384", "HS512",
-		"RS3256", "RS3384", "RS3512",
-		"ES3256", "ES3384", "ES3512",
-	}
+	jp := &jwtgo.Parser{ValidMethods: validSigningMethods}
 
 	keyFuncCallback := func(jwtToken *jwtgo.Token) (any, error) {
 		kid, ok := jwtToken.Header["kid"].(string)
@@ -152,7 +179,7 @@ func (r *Config) Validate(ctx context.Context, arn arn.ARN, token, accessToken, 
 		if pubkey == nil {
 			return nil, fmt.Errorf("No public key found for kid %s", kid)
 		}
-		return pubkey, nil
+		return verificationKeyFor(jwtToken.Method, pubkey)
 	}
 
 	pCfg, ok := r.arnProviderCfgsMap[arn]
@@ -168,7 +195,9 @@ func (r *Config) Validate(ctx context.Context, arn arn.ARN, token, accessToken, 
 		if err = r.PopulatePublicKey(arn); err != nil {
 			return err
 		}
-		jwtToken, err = jwtgo.ParseWithClaims(token, &mclaims, keyFuncCallback)
+		// Use the same restricted parser; the package-level parser has
+		// no algorithm allow-list.
+		jwtToken, err = jp.ParseWithClaims(token, &mclaims, keyFuncCallback)
 		if err != nil {
 			return err
 		}
