@@ -55,7 +55,9 @@ func bzip2HandoffPayload(t *testing.T) []byte {
 	if err != nil {
 		t.Fatal(err)
 	}
-	payload := append(archive, make([]byte, 70000)...)
+	payload := make([]byte, 0, len(archive)+70000+len(zeros))
+	payload = append(payload, archive...)
+	payload = append(payload, make([]byte, 70000)...)
 	payload = append(payload, zeros...)
 	return append(payload, make([]byte, bzip2HandoffHoldAt+2<<16-len(payload))...)
 }
