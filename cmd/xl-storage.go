@@ -821,6 +821,56 @@ func checkPathArgs(paths ...string) error {
 	return nil
 }
 
+// checkFilePathArgs is checkPathArgs for paths that must name an entry
+// strictly below the volume. A path that is empty or only slashes resolves
+// to the volume directory itself; writing, renaming or trashing that would
+// act on the whole volume, and CreateFile's failure cleanup would then
+// remove the volume's parent (issue #82).
+func checkFilePathArgs(paths ...string) error {
+	if err := checkPathArgs(paths...); err != nil {
+		return err
+	}
+	for _, p := range paths {
+		if strings.Trim(p, SlashSeparator) == "" {
+			return errFileAccessDenied
+		}
+	}
+	return nil
+}
+
+// isValidMetaDataDir reports whether dataDir, as recorded in xl.meta, is a
+// data directory name xlStorage writes: a UUID, or "legacy" for data kept
+// from the xl.json format. xl.meta can be written by a grid WriteAll, so a
+// stored data directory is not trusted to be a single path segment.
+func isValidMetaDataDir(dataDir string) bool {
+	if dataDir == legacyDataDir {
+		return true
+	}
+	if len(dataDir) != 36 {
+		return false
+	}
+	_, err := uuid.Parse(dataDir)
+	return err == nil
+}
+
+// metaDataDirPath joins a data directory read from xl.meta below the object
+// directory objectDir. It returns errFileCorrupt unless dataDir is a valid
+// data directory name that resolves strictly inside objectDir.
+func metaDataDirPath(objectDir, dataDir string) (string, error) {
+	if !isValidMetaDataDir(dataDir) {
+		return "", errFileCorrupt
+	}
+	return confinedPathJoin(errFileCorrupt, objectDir, dataDir)
+}
+
+// isStrictlyBelow reports whether p, once cleaned, is inside dir and not dir
+// itself.
+func isStrictlyBelow(p, dir string) bool {
+	base := strings.TrimSuffix(pathutil.Clean(dir), SlashSeparator)
+	cp := pathutil.Clean(p)
+	return strings.HasPrefix(cp, base+SlashSeparator) && len(cp) > len(base)+1
+}
+
 func (s *xlStorage) checkFormatJSON() (os.FileInfo, error) {
 	fi, err := Lstat(s.formatFile)
 	if err != nil {
@@ -1192,7 +1242,13 @@ func (s *xlStorage) deleteVersions(ctx context.Context, volume, path string, fis
 			// due to a CopyObject() bug where it might have
 			// inlined the data incorrectly, to avoid a situation
 			// where we potentially leave "DataDir"
-			filePath := pathJoin(volumeDir, path, dataDir)
+			//
+			// dataDir comes from the stored xl.meta; confine it
+			// to the object directory before trashing it.
+			filePath, err := metaDataDirPath(pathJoin(volumeDir, path), dataDir)
+			if err != nil {
+				return err
+			}
 			if err = checkPathLength(filePath); err != nil {
 				return err
 			}
@@ -1423,7 +1479,13 @@ func (s *xlStorage) DeleteVersion(ctx context.Context, volume, path string, fi F
 		// due to a CopyObject() bug where it might have
 		// inlined the data incorrectly, to avoid a situation
 		// where we potentially leave "DataDir"
-		filePath := pathJoin(volumeDir, path, dataDir)
+		//
+		// dataDir comes from the stored xl.meta; confine it to
+		// the object directory before trashing it.
+		filePath, err := metaDataDirPath(pathJoin(volumeDir, path), dataDir)
+		if err != nil {
+			return err
+		}
 		if err = checkPathLength(filePath); err != nil {
 			return err
 		}
@@ -1751,6 +1813,11 @@ func (s *xlStorage) ReadVersion(ctx context.Context, origvolume, volume, path, v
 	})
 	if err != nil {
 		return fi, err
+	}
+	// fi.DataDir comes from the stored xl.meta and is joined below path
+	// to read inline data; it must be a single data directory name.
+	if fi.DataDir != "" && !isValidMetaDataDir(fi.DataDir) {
+		return FileInfo{}, errFileCorrupt
 	}
 
 	if len(fi.Data) == 0 {
@@ -2172,7 +2239,7 @@ func (s *xlStorage) CreateFile(ctx context.Context, origvolume, volume, path str
 	if err != nil {
 		return err
 	}
-	if err = checkPathArgs(path); err != nil {
+	if err = checkFilePathArgs(path); err != nil {
 		return err
 	}
 
@@ -2184,9 +2251,10 @@ func (s *xlStorage) CreateFile(ctx context.Context, origvolume, volume, path str
 	parentFilePath := pathutil.Dir(filePath)
 	defer func() {
 		if err != nil {
-			if volume == minioMetaTmpBucket {
-				// only cleanup parent path if the
-				// parent volume name is minioMetaTmpBucket
+			// only cleanup parent path if the parent volume name is
+			// minioMetaTmpBucket, and never the tmp volume itself or
+			// anything above it.
+			if volume == minioMetaTmpBucket && isStrictlyBelow(parentFilePath, volumeDir) {
 				removeAll(parentFilePath)
 			}
 		}
@@ -2285,7 +2353,7 @@ func (s *xlStorage) writeAllMeta(ctx context.Context, volume string, path string
 	if err != nil {
 		return err
 	}
-	if err = checkPathArgs(path); err != nil {
+	if err = checkFilePathArgs(path); err != nil {
 		return err
 	}
 
@@ -2363,7 +2431,7 @@ func (s *xlStorage) writeAll(ctx context.Context, volume string, path string, b 
 	if err != nil {
 		return err
 	}
-	if err = checkPathArgs(path); err != nil {
+	if err = checkFilePathArgs(path); err != nil {
 		return err
 	}
 
@@ -2399,7 +2467,7 @@ func (s *xlStorage) AppendFile(ctx context.Context, volume string, path string, 
 	if err != nil {
 		return err
 	}
-	if err = checkPathArgs(path); err != nil {
+	if err = checkFilePathArgs(path); err != nil {
 		return err
 	}
 
@@ -2580,7 +2648,9 @@ func (s *xlStorage) DeleteBulk(ctx context.Context, volume string, paths ...stri
 	if err != nil {
 		return err
 	}
-	if err = checkPathArgs(paths...); err != nil {
+	// Each path is moved to trash on its own; an empty or "/" path would
+	// move the whole volume.
+	if err = checkFilePathArgs(paths...); err != nil {
 		return err
 	}
 
@@ -2674,8 +2744,12 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 		return res, err
 	}
 
-	// fi.DataDir names the data directory below both paths.
-	if err = checkPathArgs(srcPath, dstPath, fi.DataDir); err != nil {
+	// fi.DataDir names the data directory below both paths. Both paths
+	// must name an object below their volume, not the volume itself.
+	if err = checkFilePathArgs(srcPath, dstPath); err != nil {
+		return res, err
+	}
+	if err = checkPathArgs(fi.DataDir); err != nil {
 		return res, err
 	}
 
@@ -2876,7 +2950,9 @@ func (s *xlStorage) RenameData(ctx context.Context, srcVolume, srcPath string, f
 	_, ver, err := xlMeta.findVersionStr(reqVID)
 	if err == nil {
 		dataDir := ver.getDataDir()
-		if dataDir != "" && (xlMeta.SharedDataDirCountStr(reqVID, dataDir) == 0) {
+		// dataDir comes from the stored xl.meta; xl.meta.bkp is written
+		// below it, so only a valid data directory name is kept.
+		if dataDir != "" && isValidMetaDataDir(dataDir) && (xlMeta.SharedDataDirCountStr(reqVID, dataDir) == 0) {
 			// Purge the destination path as we are not preserving anything
 			// versioned object was not requested.
 			res.OldDataDir = dataDir
@@ -3018,7 +3094,10 @@ func (s *xlStorage) RenamePart(ctx context.Context, srcVolume, srcPath, dstVolum
 		return err
 	}
 	// skipParent is joined below dstVolumeDir and bounds renameAll.
-	if err = checkPathArgs(srcPath, dstPath, skipParent); err != nil {
+	if err = checkFilePathArgs(srcPath, dstPath); err != nil {
+		return err
+	}
+	if err = checkPathArgs(skipParent); err != nil {
 		return err
 	}
 	if !skipAccessChecks(srcVolume) {
@@ -3098,7 +3177,8 @@ func (s *xlStorage) RenameFile(ctx context.Context, srcVolume, srcPath, dstVolum
 	if err != nil {
 		return err
 	}
-	if err = checkPathArgs(srcPath, dstPath); err != nil {
+	// A path naming the volume itself would rename the whole volume.
+	if err = checkFilePathArgs(srcPath, dstPath); err != nil {
 		return err
 	}
 	if !skipAccessChecks(srcVolume) {
