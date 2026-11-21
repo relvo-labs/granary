@@ -696,32 +696,33 @@ func (sts *stsAPIHandlers) AssumeRoleWithLDAPIdentity(w http.ResponseWriter, r *
 		return
 	}
 
-	// Refuse further guesses once a username or source address has too many
-	// recent failures. The decision depends only on the submitted username
-	// and address, never on whether the account exists, and is taken before
-	// contacting LDAP so that a correct password cannot be confirmed while
-	// throttled.
-	ldapLimiter := globalIAMSys.LDAPConfig.LoginLimiter()
+	// Login refuses further guesses once the username or source address has
+	// too many recent failures, before contacting LDAP, so that a correct
+	// password cannot be confirmed while throttled. The decision depends
+	// only on the submitted username and address, never on whether the
+	// account exists. Rejected credentials are answered no earlier than a
+	// minimum response time, so that timing does not reveal it either.
 	sourceIP := handlers.GetSourceIPRaw(r)
-	if !ldapLimiter.Reserve(ldapUsername, sourceIP) {
-		writeSTSErrorResponse(ctx, w, ErrSTSTooManyRequests, nil)
-		return
-	}
-
-	lookupResult, groupDistNames, err := globalIAMSys.LDAPConfig.Bind(ldapUsername, ldapPassword)
-	ldapLimiter.Finish(ldapUsername, sourceIP, errors.Is(err, xldap.ErrInvalidCredentials))
+	lookupResult, groupDistNames, err := globalIAMSys.LDAPConfig.Login(ctx, ldapUsername, ldapPassword, sourceIP)
 	if err != nil {
-		if errors.Is(err, xldap.ErrInvalidCredentials) {
+		switch {
+		case errors.Is(err, xldap.ErrLoginThrottled):
+			writeSTSErrorResponse(ctx, w, ErrSTSTooManyRequests, nil)
+		case errors.Is(err, xldap.ErrInvalidCredentials):
 			// Unknown account, wrong password and disabled account all
 			// look the same to the client; only the server log says which.
-			stsLogIf(ctx, fmt.Errorf("LDAP login failed for username %q from %s: %w", ldapUsername, sourceIP, err), logger.InfoKind)
+			logUser := ldapUsername
+			if len(logUser) > xldap.MaxLoginUsernameLength {
+				logUser = logUser[:xldap.MaxLoginUsernameLength] + "..."
+			}
+			stsLogIf(ctx, fmt.Errorf("LDAP login failed for username %q from %s: %w", logUser, sourceIP, err), logger.InfoKind)
 			writeSTSErrorResponse(ctx, w, ErrSTSInvalidParameterValue, errLDAPInvalidCredentials)
-			return
+		default:
+			// The directory could not be queried. The detail stays in the
+			// server log because it may name the user's DN.
+			stsLogIf(ctx, fmt.Errorf("LDAP server error: %w", err), logger.ErrorKind)
+			writeSTSErrorResponse(ctx, w, ErrSTSUpstreamError, nil)
 		}
-		// The directory could not be queried. The detail stays in the
-		// server log because it may name the user's DN.
-		stsLogIf(ctx, fmt.Errorf("LDAP server error: %w", err), logger.ErrorKind)
-		writeSTSErrorResponse(ctx, w, ErrSTSUpstreamError, nil)
 		return
 	}
 	ldapUserDN := lookupResult.NormDN

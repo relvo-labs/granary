@@ -121,6 +121,12 @@ var (
 			Type:        "duration",
 		},
 		config.HelpKV{
+			Key:         LoginFailureMinResponseTime,
+			Description: `minimum time a rejected LDAP STS login takes, so that response time does not reveal whether the account exists, 0s disables, at most 30s` + defaultHelpPostfix(LoginFailureMinResponseTime),
+			Optional:    true,
+			Type:        "duration",
+		},
+		config.HelpKV{
 			Key:         config.Comment,
 			Description: config.DefaultComment,
 			Optional:    true,

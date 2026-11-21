@@ -48,6 +48,13 @@ type Config struct {
 	// loginLimiter throttles repeated failed logins; shared by clones so
 	// that copies of the active configuration count failures together.
 	loginLimiter *LoginFailureLimiter
+
+	// loginFloor delays rejected logins to a minimum response time; nil
+	// disables it. Shared by clones like loginLimiter.
+	loginFloor *loginResponseFloor
+
+	// bindFn replaces Bind in Login; only set by tests.
+	bindFn func(username, password string) (*ldap.DNSearchResult, []string, error)
 }
 
 // LoginLimiter returns the failed-login limiter for this configuration. The
@@ -73,6 +80,8 @@ func (l *Config) Clone() Config {
 		LDAP:              l.LDAP.Clone(),
 		stsExpiryDuration: l.stsExpiryDuration,
 		loginLimiter:      l.loginLimiter,
+		loginFloor:        l.loginFloor,
+		bindFn:            l.bindFn,
 	}
 	return cfg
 }
@@ -96,6 +105,8 @@ const (
 	LoginFailureIPLimit   = "login_failure_ip_limit"
 	LoginFailureWindow    = "login_failure_window"
 
+	LoginFailureMinResponseTime = "login_failure_min_response_time"
+
 	EnvServerAddr         = "MINIO_IDENTITY_LDAP_SERVER_ADDR"
 	EnvSRVRecordName      = "MINIO_IDENTITY_LDAP_SRV_RECORD_NAME"
 	EnvTLSSkipVerify      = "MINIO_IDENTITY_LDAP_TLS_SKIP_VERIFY"
@@ -113,6 +124,8 @@ const (
 	EnvLoginFailureUserLimit = "MINIO_IDENTITY_LDAP_LOGIN_FAILURE_USER_LIMIT"
 	EnvLoginFailureIPLimit   = "MINIO_IDENTITY_LDAP_LOGIN_FAILURE_IP_LIMIT"
 	EnvLoginFailureWindow    = "MINIO_IDENTITY_LDAP_LOGIN_FAILURE_WINDOW"
+
+	EnvLoginFailureMinResponseTime = "MINIO_IDENTITY_LDAP_LOGIN_FAILURE_MIN_RESPONSE_TIME"
 )
 
 var removedKeys = []string{
@@ -189,6 +202,10 @@ var (
 		config.KV{
 			Key:   LoginFailureWindow,
 			Value: DefaultLoginFailureWindow.String(),
+		},
+		config.KV{
+			Key:   LoginFailureMinResponseTime,
+			Value: DefaultLoginFailureMinResponseTime.String(),
 		},
 	}
 )
@@ -297,6 +314,7 @@ func Lookup(s config.Config, rootCAs *x509.CertPool) (l Config, err error) {
 		return l, err
 	}
 	l.loginLimiter = NewLoginFailureLimiter(limitCfg)
+	l.loginFloor = newLoginResponseFloor(limitCfg.MinResponseTime)
 
 	// If enable flag was not explicitly set, we treat it as implicitly set at
 	// this point as necessary configuration is available.
@@ -380,6 +398,8 @@ func lookupLoginLimitConfig(getCfgVal func(string) string) (LoginLimitConfig, er
 		IPLimit:    DefaultLoginFailureIPLimit,
 		Window:     DefaultLoginFailureWindow,
 		MaxEntries: DefaultLoginFailureMaxEntries,
+
+		MinResponseTime: DefaultLoginFailureMinResponseTime,
 	}
 	parseLimit := func(key string, dst *int) error {
 		v := getCfgVal(key)
@@ -405,6 +425,13 @@ func lookupLoginLimitConfig(getCfgVal func(string) string) (LoginLimitConfig, er
 			return cfg, config.Errorf("invalid %s value %q: must be a positive duration such as 15m", LoginFailureWindow, v)
 		}
 		cfg.Window = d
+	}
+	if v := getCfgVal(LoginFailureMinResponseTime); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d < 0 || d > MaxLoginFailureMinResponseTime {
+			return cfg, config.Errorf("invalid %s value %q: must be a duration between 0s and %s", LoginFailureMinResponseTime, v, MaxLoginFailureMinResponseTime)
+		}
+		cfg.MinResponseTime = d
 	}
 	return cfg, nil
 }

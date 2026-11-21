@@ -18,7 +18,9 @@
 package ldap
 
 import (
+	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -39,20 +41,22 @@ func newTestLimiter(cfg LoginLimitConfig) (*LoginFailureLimiter, *fakeClock) {
 
 // fail runs one complete failed attempt and reports whether it was allowed.
 func fail(l *LoginFailureLimiter, user, ip string) bool {
-	if !l.Reserve(user, ip) {
+	a, ok := l.Reserve(user, ip)
+	if !ok {
 		return false
 	}
-	l.Finish(user, ip, true)
+	a.Finish(true)
 	return true
 }
 
 // succeed runs one complete successful attempt and reports whether it was
 // allowed.
 func succeed(l *LoginFailureLimiter, user, ip string) bool {
-	if !l.Reserve(user, ip) {
+	a, ok := l.Reserve(user, ip)
+	if !ok {
 		return false
 	}
-	l.Finish(user, ip, false)
+	a.Finish(false)
 	return true
 }
 
@@ -139,17 +143,17 @@ func TestLoginFailureLimiterConcurrentBurst(t *testing.T) {
 	l, _ := newTestLimiter(LoginLimitConfig{UserLimit: 3, IPLimit: 100, Window: time.Minute})
 	// Attempts still in flight count against the limit, so a burst of
 	// concurrent guesses cannot exceed the failure budget.
-	admitted := 0
+	var admitted []*LoginAttempt
 	for range 50 {
-		if l.Reserve("alice", "10.0.0.1") {
-			admitted++
+		if a, ok := l.Reserve("alice", "10.0.0.1"); ok {
+			admitted = append(admitted, a)
 		}
 	}
-	if admitted != 3 {
-		t.Fatalf("expected 3 concurrent attempts to be admitted, got %d", admitted)
+	if len(admitted) != 3 {
+		t.Fatalf("expected 3 concurrent attempts to be admitted, got %d", len(admitted))
 	}
-	for range admitted {
-		l.Finish("alice", "10.0.0.1", false)
+	for _, a := range admitted {
+		a.Finish(false)
 	}
 	if !succeed(l, "alice", "10.0.0.1") {
 		t.Fatal("released reservations must not throttle")
@@ -162,8 +166,11 @@ func TestLoginFailureLimiterConcurrentBurst(t *testing.T) {
 func TestLoginFailureLimiterBounded(t *testing.T) {
 	const maxEntries = 50
 	l, clk := newTestLimiter(LoginLimitConfig{UserLimit: 5, IPLimit: 5, Window: time.Minute, MaxEntries: maxEntries})
+	refused := 0
 	for i := range 10 * maxEntries {
-		fail(l, fmt.Sprintf("user-%d", i), fmt.Sprintf("198.51.100.%d", i))
+		if !fail(l, fmt.Sprintf("user-%d", i), fmt.Sprintf("198.51.100.%d", i)) {
+			refused++
+		}
 		clk.advance(time.Millisecond)
 		if u, ip := l.tracked(); u > maxEntries || ip > maxEntries {
 			t.Fatalf("tables exceed bound: %d users, %d ips", u, ip)
@@ -172,19 +179,106 @@ func TestLoginFailureLimiterBounded(t *testing.T) {
 	if u, ip := l.tracked(); u != maxEntries || ip != maxEntries {
 		t.Fatalf("expected full tables, got %d users, %d ips", u, ip)
 	}
-	// The most recent key is still tracked after eviction.
-	last := fmt.Sprintf("user-%d", 10*maxEntries-1)
-	for range 4 {
-		fail(l, last, "203.0.113.1")
+	// Keys beyond the capacity are refused rather than evicting live ones.
+	if refused != 9*maxEntries {
+		t.Fatalf("expected %d new keys to be refused while full, got %d", 9*maxEntries, refused)
 	}
-	if succeed(l, last, "203.0.113.9") {
-		t.Fatal("expected the most recent key to remain tracked")
+	// Keys that are already tracked keep working while the table is full.
+	if !fail(l, "user-0", "198.51.100.0") {
+		t.Fatal("a tracked key must not be refused because the table is full")
 	}
-	// Expired entries are reclaimed before live ones are evicted.
+	// Expired entries are reclaimed once their window ends.
 	clk.advance(time.Minute)
-	fail(l, "after-expiry", "203.0.113.2")
+	if !fail(l, "after-expiry", "203.0.113.2") {
+		t.Fatal("expected a new key to be admitted after the entries expired")
+	}
 	if u, _ := l.tracked(); u != 1 {
 		t.Fatalf("expected expired entries to be pruned, %d users tracked", u)
+	}
+}
+
+// A full table refuses new keys cheaply until the first entry can expire,
+// and admits them again as soon as an in-flight slot is freed.
+func TestLoginFailureLimiterFullTableRecovery(t *testing.T) {
+	l, clk := newTestLimiter(LoginLimitConfig{UserLimit: 5, IPLimit: 0, Window: time.Minute, MaxEntries: 2})
+	fail(l, "alice", "")
+	clk.advance(10 * time.Second)
+	pending, ok := l.Reserve("bob", "")
+	if !ok {
+		t.Fatal("bob refused")
+	}
+	if succeed(l, "carol", "") {
+		t.Fatal("expected carol to be refused while the table is full")
+	}
+	// bob's attempt finishes successfully and frees its slot.
+	pending.Finish(false)
+	if !succeed(l, "carol", "") {
+		t.Fatal("expected carol to be admitted after bob's slot was freed")
+	}
+	fail(l, "dave", "")
+	if succeed(l, "erin", "") {
+		t.Fatal("expected erin to be refused while the table is full")
+	}
+	// alice's window ends first and frees a slot.
+	clk.advance(50 * time.Second)
+	if !succeed(l, "erin", "") {
+		t.Fatal("expected erin to be admitted once alice's window ended")
+	}
+}
+
+// Finish and Abort complete an attempt exactly once.
+func TestLoginAttemptExactlyOnce(t *testing.T) {
+	l, _ := newTestLimiter(LoginLimitConfig{UserLimit: 2, IPLimit: 2, Window: time.Minute})
+	a, ok := l.Reserve("alice", "10.0.0.1")
+	if !ok {
+		t.Fatal("refused")
+	}
+	a.Finish(true)
+	a.Abort()
+	a.Finish(true)
+	if u, ip := l.pending(); u != 0 || ip != 0 {
+		t.Fatalf("pending reservations left: %d users, %d ips", u, ip)
+	}
+	// Only one failure was counted.
+	if !fail(l, "alice", "10.0.0.1") {
+		t.Fatal("a repeated completion was counted as another failure")
+	}
+	if succeed(l, "alice", "10.0.0.1") {
+		t.Fatal("expected throttling after two failures")
+	}
+	// Abort without Finish releases the reservation without counting.
+	b, ok := l.Reserve("bob", "10.0.0.2")
+	if !ok {
+		t.Fatal("refused")
+	}
+	b.Abort()
+	if u, ip := l.tracked(); u != 1 || ip != 1 {
+		t.Fatalf("aborted attempt left state behind: %d users, %d ips", u, ip)
+	}
+	// A nil attempt, as returned by a disabled limiter, is a no-op.
+	var none *LoginAttempt
+	none.Finish(true)
+	none.Abort()
+}
+
+func TestLoginCredentialLengthLimits(t *testing.T) {
+	for _, c := range []struct {
+		user, pass string
+		ok         bool
+	}{
+		{"alice", "secret", true},
+		{strings.Repeat("u", MaxLoginUsernameLength), strings.Repeat("p", MaxLoginPasswordLength), true},
+		{strings.Repeat("u", MaxLoginUsernameLength+1), "secret", false},
+		{"alice", strings.Repeat("p", MaxLoginPasswordLength+1), false},
+	} {
+		if got := ValidLoginCredentialLengths(c.user, c.pass); got != c.ok {
+			t.Errorf("lengths %d/%d: got %v, want %v", len(c.user), len(c.pass), got, c.ok)
+		}
+	}
+	// Bind enforces the same limit for its other callers.
+	var cfg Config
+	if _, _, err := cfg.Bind(strings.Repeat("u", MaxLoginUsernameLength+1), "secret"); !errors.Is(err, ErrInvalidCredentials) {
+		t.Fatalf("expected Bind to reject an over-long username as invalid credentials, got %v", err)
 	}
 }
 
@@ -225,6 +319,8 @@ func TestLookupLoginLimitConfig(t *testing.T) {
 		IPLimit:    DefaultLoginFailureIPLimit,
 		Window:     DefaultLoginFailureWindow,
 		MaxEntries: DefaultLoginFailureMaxEntries,
+
+		MinResponseTime: DefaultLoginFailureMinResponseTime,
 	}
 	if cfg != want {
 		t.Fatalf("defaults: got %+v, want %+v", cfg, want)
@@ -234,11 +330,13 @@ func TestLookupLoginLimitConfig(t *testing.T) {
 		LoginFailureUserLimit: "5",
 		LoginFailureIPLimit:   "0",
 		LoginFailureWindow:    "1h",
+
+		LoginFailureMinResponseTime: "250ms",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.UserLimit != 5 || cfg.IPLimit != 0 || cfg.Window != time.Hour {
+	if cfg.UserLimit != 5 || cfg.IPLimit != 0 || cfg.Window != time.Hour || cfg.MinResponseTime != 250*time.Millisecond {
 		t.Fatalf("unexpected parsed config %+v", cfg)
 	}
 
@@ -247,6 +345,9 @@ func TestLookupLoginLimitConfig(t *testing.T) {
 		{LoginFailureIPLimit: "many"},
 		{LoginFailureWindow: "0s"},
 		{LoginFailureWindow: "soon"},
+		{LoginFailureMinResponseTime: "-1s"},
+		{LoginFailureMinResponseTime: "31s"},
+		{LoginFailureMinResponseTime: "later"},
 	} {
 		if _, err := lookup(bad); err == nil {
 			t.Fatalf("expected error for %v", bad)
@@ -255,7 +356,7 @@ func TestLookupLoginLimitConfig(t *testing.T) {
 }
 
 func TestLoginLimitKeysDocumented(t *testing.T) {
-	for _, key := range []string{LoginFailureUserLimit, LoginFailureIPLimit, LoginFailureWindow} {
+	for _, key := range []string{LoginFailureUserLimit, LoginFailureIPLimit, LoginFailureWindow, LoginFailureMinResponseTime} {
 		if _, ok := DefaultKVS.Lookup(key); !ok {
 			t.Errorf("%s missing from DefaultKVS", key)
 		}

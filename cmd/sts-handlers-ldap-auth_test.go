@@ -77,8 +77,21 @@ func (s *TestSuiteIAM) postLDAPSTS(c *check, username, password string) ldapSTSR
 
 const (
 	testLDAPFailureUserLimit = 3
-	testLDAPFailureWindow    = 3 * time.Second
+	// The window is long enough never to expire during the test; expiry is
+	// covered with a controllable clock in internal/config/identity/ldap.
+	testLDAPFailureWindow = time.Hour
+	// Lower bounds on durations are deterministic; the test never asserts
+	// that a request is fast.
+	testLDAPMinResponseTime = 300 * time.Millisecond
 )
+
+// timedPostLDAPSTS is postLDAPSTS that also returns how long the call took.
+func (s *TestSuiteIAM) timedPostLDAPSTS(c *check, username, password string) (ldapSTSResult, time.Duration) {
+	c.Helper()
+	start := time.Now()
+	r := s.postLDAPSTS(c, username, password)
+	return r, time.Since(start)
+}
 
 // TestIAMWithLDAPAuthFailureServerSuite checks that LDAP STS logins do not
 // reveal whether an account exists and that repeated failures are throttled
@@ -144,22 +157,32 @@ func (s *TestSuiteIAM) TestLDAPSTSAuthFailures(c *check) {
 		}
 	}
 
+	// Over-long credentials get the same response, without reaching the
+	// directory or the limiter.
+	if r := s.postLDAPSTS(c, strings.Repeat("x", 600), "wrong-password"); r != wrongPass {
+		c.Fatalf("over-long username response differs:\n over-long:      %+v\n wrong password: %+v", r, wrongPass)
+	}
+
 	// Lower the throttling limits so that they can be exercised quickly. The
 	// restart also starts with fresh counters.
 	_, err := s.adm.SetConfigKV(ctx, fmt.Sprintf(
-		"identity_ldap login_failure_user_limit=%d login_failure_ip_limit=1000 login_failure_window=%s",
-		testLDAPFailureUserLimit, testLDAPFailureWindow))
+		"identity_ldap login_failure_user_limit=%d login_failure_ip_limit=1000 login_failure_window=%s login_failure_min_response_time=%s",
+		testLDAPFailureUserLimit, testLDAPFailureWindow, testLDAPMinResponseTime))
 	if err != nil {
 		c.Fatalf("unable to configure LDAP login throttling: %v", err)
 	}
 	s.RestartIAMSuite(c)
 
-	// The configuration change keeps the uniform failure response.
-	if r := s.postLDAPSTS(c, validUser, "wrong-password"); r != wrongPass {
-		c.Fatalf("unexpected response after reconfiguration: %+v", r)
-	}
-	if r := s.postLDAPSTS(c, missingUser, "wrong-password"); r != wrongPass {
-		c.Fatalf("unexpected response after reconfiguration: %+v", r)
+	// The configuration change keeps the uniform failure response, and
+	// every rejection takes at least the minimum response time.
+	for _, user := range []string{validUser, missingUser} {
+		r, took := s.timedPostLDAPSTS(c, user, "wrong-password")
+		if r != wrongPass {
+			c.Fatalf("unexpected response after reconfiguration: %+v", r)
+		}
+		if took < testLDAPMinResponseTime {
+			c.Fatalf("rejection for %q took %v, less than the minimum response time %v", user, took, testLDAPMinResponseTime)
+		}
 	}
 
 	// 2. Successful logins are never counted as failures.
@@ -189,11 +212,5 @@ func (s *TestSuiteIAM) TestLDAPSTSAuthFailures(c *check) {
 	}
 	if throttledValid != throttledMissing {
 		c.Fatalf("throttled responses differ:\n known user:   %+v\n unknown user: %+v", throttledValid, throttledMissing)
-	}
-
-	// 5. Throttling expires with the configured window.
-	time.Sleep(testLDAPFailureWindow + 500*time.Millisecond)
-	if r := s.postLDAPSTS(c, validUser, validPass); r.Status != http.StatusOK {
-		c.Fatalf("expected login to succeed after throttling window, got %+v", r)
 	}
 }
