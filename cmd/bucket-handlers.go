@@ -463,9 +463,9 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 	// Make sure to update context to print ObjectNames for multi objects.
 	ctx = updateReqContext(ctx, objects...)
 
-	// Call checkRequestAuthType to populate ReqInfo.AccessKey before GetBucketInfo()
-	// Ignore errors here to preserve the S3 error behavior of GetBucketInfo()
-	checkRequestAuthType(ctx, r, policy.DeleteObjectAction, bucket, "")
+	// Authenticate the original headers once before any per-object lookup.
+	// Report authentication errors below with the existing multi-delete behavior.
+	authErr := authenticateRequest(ctx, r, policy.DeleteObjectAction)
 
 	deleteObjectsFn := objectAPI.DeleteObjects
 
@@ -499,7 +499,28 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 	vc, _ := globalBucketVersioningSys.Get(bucket)
 	oss := make([]*objSweeper, len(deleteObjectsReq.Objects))
 	for index, object := range deleteObjectsReq.Objects {
-		if apiErrCode := checkRequestAuthTypeWithVID(ctx, r, policy.DeleteObjectAction, bucket, object.ObjectName, object.VersionID); apiErrCode != ErrNone {
+		apiErrCode := authErr
+		if apiErrCode == ErrNone {
+			authInfo, authInfoErr := getObjectInfoFn(ctx, bucket, object.ObjectName, ObjectOptions{VersionID: object.VersionID})
+			authReq := r.Clone(r.Context())
+			setExistingObjectTagsForVersion(authReq, "", object.VersionID)
+			if authInfoErr == nil {
+				setExistingObjectTagsForVersion(authReq, authInfo.UserTags, object.VersionID)
+			}
+			reqInfo := logger.GetReqInfo(ctx)
+			reqInfo.ObjectName, reqInfo.VersionID = object.ObjectName, object.VersionID
+			if getRequestAuthType(authReq) == authTypeAnonymous {
+				apiErrCode = checkRequestAuthTypeWithVID(ctx, authReq, policy.DeleteObjectAction, bucket, object.ObjectName, object.VersionID)
+			} else {
+				// Signed headers were authenticated before adding stored tags.
+				apiErrCode = authorizeRequest(ctx, authReq, policy.DeleteObjectAction)
+			}
+			if apiErrCode == ErrNone && authInfoErr != nil && !isErrObjectNotFound(authInfoErr) && !isErrVersionNotFound(authInfoErr) &&
+				!isErrBucketNotFound(authInfoErr) && (!authInfo.DeleteMarker || !isErrMethodNotAllowed(authInfoErr)) {
+				apiErrCode = toAPIErrorCode(ctx, authInfoErr)
+			}
+		}
+		if apiErrCode != ErrNone {
 			if apiErrCode == ErrSignatureDoesNotMatch || apiErrCode == ErrInvalidAccessKeyID {
 				writeErrorResponse(ctx, w, errorCodes.ToAPIErr(apiErrCode), r.URL)
 				return
@@ -567,7 +588,9 @@ func (api objectAPIHandlers) DeleteMultipleObjectsHandler(w http.ResponseWriter,
 			}
 		}
 		if object.VersionID != "" && hasLockEnabled {
-			if err := enforceRetentionBypassForDelete(ctx, r, bucket, object, goi, gerr); err != nil {
+			authReq := r.Clone(r.Context())
+			setExistingObjectTagsForVersion(authReq, goi.UserTags, object.VersionID)
+			if err := enforceRetentionBypassForDelete(ctx, authReq, bucket, object, goi, gerr); err != nil {
 				apiErr := toAPIError(ctx, err)
 				deleteResults[index].errInfo = DeleteError{
 					Code:      apiErr.Code,
@@ -1153,36 +1176,44 @@ func (api objectAPIHandlers) PostPolicyBucketHandler(w http.ResponseWriter, r *h
 		return
 	}
 
+	// Fan-out entries name independent destinations and do not use the POST
+	// tagging XML. Authorize each destination using its own stored tags.
+	authTargets := []string{object}
 	if len(fanOutEntries) > 0 {
-		// Once signature is validated, check if the user has
-		// explicit permissions for the user.
+		authTargets = make([]string, 0, len(fanOutEntries))
+		for _, entry := range fanOutEntries {
+			authTargets = append(authTargets, entry.Key)
+		}
+	} else if input := formValues.Get(postPolicyBucketTagging); input != "" {
+		requestTags, parseErr := tags.ParseObjectXML(strings.NewReader(input))
+		if parseErr != nil {
+			writeErrorResponse(ctx, w, toAPIError(ctx, parseErr), r.URL)
+			return
+		}
+		setRequestObjectTags(r, requestTags.String())
+	}
+	for _, target := range authTargets {
+		authReq := r.Clone(r.Context())
+		tagErr := loadExistingObjectTags(ctx, authReq, objectAPI, bucket, target)
+		action := policy.Action(policy.PutObjectAction)
+		if len(fanOutEntries) > 0 {
+			action = policy.PutObjectFanOutAction
+		}
 		if !globalIAMSys.IsAllowed(policy.Args{
 			AccountName:     cred.AccessKey,
 			Groups:          cred.Groups,
-			Action:          policy.PutObjectFanOutAction,
-			ConditionValues: getConditionValues(r, "", cred),
+			Action:          action,
+			ConditionValues: getConditionValues(authReq, "", cred),
 			BucketName:      bucket,
-			ObjectName:      object,
+			ObjectName:      target,
 			IsOwner:         globalActiveCred.AccessKey == cred.AccessKey,
 			Claims:          cred.Claims,
 		}) {
 			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrAccessDenied), r.URL)
 			return
 		}
-	} else {
-		// Once signature is validated, check if the user has
-		// explicit permissions for the user.
-		if !globalIAMSys.IsAllowed(policy.Args{
-			AccountName:     cred.AccessKey,
-			Groups:          cred.Groups,
-			Action:          policy.PutObjectAction,
-			ConditionValues: getConditionValues(r, "", cred),
-			BucketName:      bucket,
-			ObjectName:      object,
-			IsOwner:         globalActiveCred.AccessKey == cred.AccessKey,
-			Claims:          cred.Claims,
-		}) {
-			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrAccessDenied), r.URL)
+		if tagErr != nil {
+			writeErrorResponse(ctx, w, toAPIError(ctx, tagErr), r.URL)
 			return
 		}
 	}

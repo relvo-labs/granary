@@ -34,6 +34,7 @@ import (
 	"github.com/relvo-labs/granary/internal/crypto"
 	xhttp "github.com/relvo-labs/granary/internal/http"
 	xioutil "github.com/relvo-labs/granary/internal/ioutil"
+	"github.com/relvo-labs/granary/internal/logger"
 )
 
 const (
@@ -84,7 +85,8 @@ func (api objectAPIHandlers) getObjectInArchiveFileHandler(ctx context.Context, 
 
 	// Check for auth type to return S3 compatible error.
 	// type to return the correct error (NoSuchKey vs AccessDenied)
-	if s3Error := checkRequestAuthType(ctx, r, policy.GetObjectAction, bucket, zipPath); s3Error != ErrNone {
+	logger.GetReqInfo(ctx).ObjectName = zipPath
+	if s3Error := authenticateRequest(ctx, r, policy.GetObjectAction); s3Error != ErrNone {
 		if getRequestAuthType(r) == authTypeAnonymous {
 			// As per "Permission" section in
 			// https://docs.aws.amazon.com/AmazonS3/latest/API/RESTObjectGET.html
@@ -133,10 +135,20 @@ func (api objectAPIHandlers) getObjectInArchiveFileHandler(ctx context.Context, 
 			return true
 		}
 
+		setExistingObjectTags(r, oi.UserTags)
+		if s3Error := authorizeRequest(ctx, r, policy.GetObjectAction); s3Error != ErrNone {
+			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+			return true
+		}
 		return checkPreconditions(ctx, w, r, oi, opts)
 	}
 
 	zipObjInfo, err := getObjectInfo(ctx, bucket, zipPath, opts)
+	setExistingObjectTags(r, zipObjInfo.UserTags)
+	if s3Error := authorizeRequest(ctx, r, policy.GetObjectAction); s3Error != ErrNone {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+		return
+	}
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
@@ -379,7 +391,8 @@ func (api objectAPIHandlers) headObjectInArchiveFileHandler(ctx context.Context,
 		return
 	}
 
-	if s3Error := checkRequestAuthType(ctx, r, policy.GetObjectAction, bucket, zipPath); s3Error != ErrNone {
+	logger.GetReqInfo(ctx).ObjectName = zipPath
+	if s3Error := authenticateRequest(ctx, r, policy.GetObjectAction); s3Error != ErrNone {
 		if getRequestAuthType(r) == authTypeAnonymous {
 			// As per "Permission" section in
 			// https://docs.aws.amazon.com/AmazonS3/latest/API/RESTObjectHEAD.html
@@ -415,6 +428,11 @@ func (api objectAPIHandlers) headObjectInArchiveFileHandler(ctx context.Context,
 
 	// Validate pre-conditions if any.
 	opts.CheckPrecondFn = func(oi ObjectInfo) bool {
+		setExistingObjectTags(r, oi.UserTags)
+		if s3Error := authorizeRequest(ctx, r, policy.GetObjectAction); s3Error != ErrNone {
+			writeErrorResponseHeadersOnly(w, errorCodes.ToAPIErr(s3Error))
+			return true
+		}
 		return checkPreconditions(ctx, w, r, oi, opts)
 	}
 
@@ -430,6 +448,11 @@ func (api objectAPIHandlers) headObjectInArchiveFileHandler(ctx context.Context,
 	}
 
 	zipObjInfo, err := getObjectInfo(ctx, bucket, zipPath, opts)
+	setExistingObjectTags(r, zipObjInfo.UserTags)
+	if s3Error := authorizeRequest(ctx, r, policy.GetObjectAction); s3Error != ErrNone {
+		writeErrorResponseHeadersOnly(w, errorCodes.ToAPIErr(s3Error))
+		return
+	}
 	if err != nil {
 		writeErrorResponseHeadersOnly(w, toAPIError(ctx, err))
 		return
