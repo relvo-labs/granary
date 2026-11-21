@@ -209,42 +209,42 @@ func (l *LoginFailureLimiter) Reserve(username, sourceIP string) (*LoginAttempt,
 	defer l.mu.Unlock()
 	now := l.now()
 
-	var ue, ie *loginFailure
+	var userEntry, ipEntry *loginFailure
 	if useUser {
-		ue = l.users.lookup(a.userK, now, l.window)
-		if ue != nil && ue.failures+ue.pending >= l.users.limit {
+		userEntry = l.users.lookup(a.userK, now, l.window)
+		if userEntry != nil && userEntry.failures+userEntry.pending >= l.users.limit {
 			return nil, false
 		}
 	}
 	if useIP {
-		ie = l.ips.lookup(a.ipK, now, l.window)
-		if ie != nil && ie.failures+ie.pending >= l.ips.limit {
+		ipEntry = l.ips.lookup(a.ipK, now, l.window)
+		if ipEntry != nil && ipEntry.failures+ipEntry.pending >= l.ips.limit {
 			return nil, false
 		}
 	}
 	// Check capacity of both tables before creating anything, so that a
 	// refused attempt leaves no state behind.
-	if useUser && ue == nil && !l.users.hasRoom(now, l.window, l.maxEntries) {
+	if useUser && userEntry == nil && !l.users.hasRoom(now, l.window, l.maxEntries) {
 		return nil, false
 	}
-	if useIP && ie == nil && !l.ips.hasRoom(now, l.window, l.maxEntries) {
+	if useIP && ipEntry == nil && !l.ips.hasRoom(now, l.window, l.maxEntries) {
 		return nil, false
 	}
 	if useUser {
-		if ue == nil {
-			ue = &loginFailure{start: now}
-			l.users.entries[a.userK] = ue
+		if userEntry == nil {
+			userEntry = &loginFailure{start: now}
+			l.users.entries[a.userK] = userEntry
 		}
-		ue.pending++
-		a.user = ue
+		userEntry.pending++
+		a.user = userEntry
 	}
 	if useIP {
-		if ie == nil {
-			ie = &loginFailure{start: now}
-			l.ips.entries[a.ipK] = ie
+		if ipEntry == nil {
+			ipEntry = &loginFailure{start: now}
+			l.ips.entries[a.ipK] = ipEntry
 		}
-		ie.pending++
-		a.ip = ie
+		ipEntry.pending++
+		a.ip = ipEntry
 	}
 	a.start = now
 	return a, true
