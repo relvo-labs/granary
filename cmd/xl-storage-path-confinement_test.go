@@ -542,10 +542,6 @@ func checkPathConfinementAllowsInternalPaths(t *testing.T, disk StorageAPI, loca
 		if strings.HasSuffix(p, "/") {
 			continue
 		}
-		if p == "..." && runtime.GOOS == globalWindowsOSName {
-			// Win32 resolves a trailing "..." to its parent (issue #82).
-			continue
-		}
 		must("WriteAll "+p, disk.WriteAll(ctx, bkt, p, []byte(p)))
 		buf, err := disk.ReadAll(ctx, bkt, p)
 		if err != nil || string(buf) != p {
@@ -619,4 +615,94 @@ func checkPathConfinementAllowsInternalPaths(t *testing.T, disk StorageAPI, loca
 	}
 	must("DeleteVersion last", disk.DeleteVersion(ctx, bkt, "dir/obj", fi, false, DeleteOptions{}))
 	must("Delete dir/", disk.Delete(ctx, bkt, "dir/", DeleteOptions{Recursive: true, Immediate: true}))
+}
+
+// TestXLStorageDeleteFileStaysBelowBase checks deleteFile's own bound:
+// it removes or trashes deletePath only when that is strictly below
+// basePath. A sibling whose name merely starts with the base name (bkt2
+// next to bkt) is outside the base and must survive, as must the base and
+// its parent (issue #82).
+func TestXLStorageDeleteFileStaysBelowBase(t *testing.T) {
+	drive := t.TempDir()
+	xl, err := newLocalXLStorage(drive)
+	if err != nil {
+		t.Fatalf("newLocalXLStorage: %v", err)
+	}
+	base := pathJoin(drive, "bkt")
+	sibling := pathJoin(drive, "bkt2")
+	for _, recursive := range []bool{false, true} {
+		for _, target := range []string{
+			pathJoin(sibling, "x"),
+			sibling + SlashSeparator,
+			sibling,
+			base,
+			base + SlashSeparator,
+			drive,
+		} {
+			derivedMustWrite(t, filepath.Join(sibling, "x"), gridConfinementMarker)
+			derivedMustWrite(t, filepath.Join(base, "keep"), gridConfinementMarker)
+			_ = xl.deleteFile(base, target, recursive, true)
+			for _, p := range []string{filepath.Join(sibling, "x"), filepath.Join(base, "keep")} {
+				if b, err := os.ReadFile(p); err != nil || !bytes.Equal(b, gridConfinementMarker) {
+					t.Fatalf("deleteFile(%q, %q, recursive=%v) removed %q: %v", base, target, recursive, p, err)
+				}
+			}
+		}
+	}
+
+	// Positive control: entries strictly below the base are still removed,
+	// and the walk up through empty parents stops at the base.
+	derivedMustWrite(t, filepath.Join(base, "x"), gridConfinementMarker)
+	derivedMustWrite(t, filepath.Join(base, "dir", "sub", "y"), gridConfinementMarker)
+	if err := xl.deleteFile(base, pathJoin(base, "x"), false, true); err != nil {
+		t.Fatalf("deleteFile x: %v", err)
+	}
+	if err := xl.deleteFile(base, pathJoin(base, "dir", "sub")+SlashSeparator, true, true); err != nil {
+		t.Fatalf("deleteFile dir/sub/: %v", err)
+	}
+	for _, p := range []string{filepath.Join(base, "x"), filepath.Join(base, "dir")} {
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Fatalf("deleteFile left %q: %v", p, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(base, "keep")); err != nil {
+		t.Fatalf("base entry: %v", err)
+	}
+}
+
+// TestXLStoragePosixBackslashNamesAllowed is a positive control: on the
+// supported (Linux) platform '\' is an ordinary character that S3 object
+// names may contain, so such names keep working and a failed tmp CreateFile
+// still cleans up its own upload directory.
+func TestXLStoragePosixBackslashNamesAllowed(t *testing.T) {
+	if runtime.GOOS == globalWindowsOSName {
+		t.Skip("'\\' is a path separator on Windows; see issue #98")
+	}
+	forEachDerivedConfinementDisk(t, func(t *testing.T, d derivedConfinementDisk) {
+		ctx := t.Context()
+		bkt := gridConfinementBucket
+		for _, p := range []string{`a\b`, `dir\sub/file`, `x\..y`, `\lead`} {
+			if err := d.disk.WriteAll(ctx, bkt, p, []byte(p)); err != nil {
+				t.Fatalf("WriteAll %q: %v", p, err)
+			}
+			buf, err := d.disk.ReadAll(ctx, bkt, p)
+			if err != nil || string(buf) != p {
+				t.Fatalf("ReadAll %q: %q %v", p, buf, err)
+			}
+			if err := d.disk.Delete(ctx, bkt, p, DeleteOptions{}); err != nil {
+				t.Fatalf("Delete %q: %v", p, err)
+			}
+		}
+		upload := `up\` + uuid.NewString()
+		err := d.disk.CreateFile(ctx, "", minioMetaTmpBucket, upload+"/part.1", 64, bytes.NewReader([]byte("short")))
+		if err == nil {
+			t.Fatal("CreateFile with a short body was accepted")
+		}
+		if _, err := os.Stat(filepath.Join(d.drive, minioMetaTmpBucket, upload)); !os.IsNotExist(err) {
+			t.Fatalf("failed CreateFile did not clean up %q: %v", upload, err)
+		}
+		if _, err := os.Stat(filepath.Join(d.drive, minioMetaTmpBucket)); err != nil {
+			t.Fatalf("tmp volume: %v", err)
+		}
+	})
 }

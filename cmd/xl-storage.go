@@ -811,70 +811,27 @@ func (s *xlStorage) getVolDir(volume string) (string, error) {
 // slashes are allowed, matching setRequestValidityMiddleware: pathJoin
 // collapses them below the volume. An empty path (the volume itself) is
 // allowed too. Grid storage RPCs do not pass the middleware, so every
-// xlStorage method checks its path arguments here (issue #82). On Windows the
-// path must also be unambiguous for the drive filesystem; see
-// hasAmbiguousDrivePathSegment.
+// xlStorage method checks its path arguments here (issue #82).
 func checkPathArgs(paths ...string) error {
-	return checkDrivePathArgs(drivePathWindows, false, paths...)
+	for _, p := range paths {
+		if hasBadPathComponent(p) {
+			return errFileAccessDenied
+		}
+	}
+	return nil
 }
 
 // checkFilePathArgs is checkPathArgs for paths that must name an entry
-// strictly below the volume. A path that is empty or only separators
-// resolves to the volume directory itself; writing, renaming or trashing
-// that would act on the whole volume, and CreateFile's failure cleanup would
-// then remove the volume's parent (issue #82).
+// strictly below the volume. A path that is empty or only slashes resolves
+// to the volume directory itself; writing, renaming or trashing that would
+// act on the whole volume, and CreateFile's failure cleanup would then
+// remove the volume's parent (issue #82).
 func checkFilePathArgs(paths ...string) error {
-	return checkDrivePathArgs(drivePathWindows, true, paths...)
-}
-
-// drivePathWindows is true where drive paths follow Windows rules: '\' is a
-// path separator as well as '/', and Win32 path normalization drops trailing
-// dots and spaces from a path. Granary cross-compiles for windows/amd64.
-const drivePathWindows = os.PathSeparator == '\\'
-
-// isDrivePathSep reports whether r separates path segments on the drive.
-// Elsewhere '\' is an ordinary character that S3 object names may contain.
-func isDrivePathSep(r rune, windows bool) bool {
-	return r == SlashSeparatorChar || (windows && r == '\\')
-}
-
-// hasAmbiguousDrivePathSegment reports whether p, under Windows rules, has a
-// segment that Win32 resolves to something other than a plain name below its
-// parent: a segment made only of dots and spaces (after trailing-dot and
-// space removal it names the parent directory), or a ':' (drive-relative
-// names and alternate data streams). Neither is valid in a Windows object
-// name or bucket name, and Granary writes neither on Windows. It always
-// reports false for other platforms.
-func hasAmbiguousDrivePathSegment(p string, windows bool) bool {
-	if !windows {
-		return false
-	}
-	if strings.ContainsRune(p, ':') {
-		return true
-	}
-	for _, seg := range strings.FieldsFunc(p, func(r rune) bool { return isDrivePathSep(r, true) }) {
-		if strings.Trim(seg, ". ") == "" {
-			return true
-		}
-	}
-	return false
-}
-
-// checkDrivePathArgs implements checkPathArgs (fileTarget false) and
-// checkFilePathArgs (fileTarget true) for the given platform rule, so the
-// Windows rule is testable everywhere.
-func checkDrivePathArgs(windows, fileTarget bool, paths ...string) error {
-	seps := SlashSeparator
-	if windows {
-		seps += `\`
+	if err := checkPathArgs(paths...); err != nil {
+		return err
 	}
 	for _, p := range paths {
-		if hasBadPathComponent(p) || hasAmbiguousDrivePathSegment(p, windows) {
-			return errFileAccessDenied
-		}
-		// With no ".", ".." or (on Windows) dot-only segment left, a path
-		// names the volume itself exactly when it is only separators.
-		if fileTarget && strings.Trim(p, seps) == "" {
+		if strings.Trim(p, SlashSeparator) == "" {
 			return errFileAccessDenied
 		}
 	}
@@ -906,53 +863,12 @@ func metaDataDirPath(objectDir, dataDir string) (string, error) {
 	return confinedPathJoin(errFileCorrupt, objectDir, dataDir)
 }
 
-// isStrictlyBelow reports whether p is inside dir and not dir itself, as
-// the drive filesystem resolves both.
+// isStrictlyBelow reports whether p, once cleaned, is inside dir and not dir
+// itself.
 func isStrictlyBelow(p, dir string) bool {
-	return isStrictlyBelowDrive(p, dir, drivePathWindows)
-}
-
-// cleanDrivePath cleans p the way the drive filesystem resolves it, with '/'
-// separators. Under Windows rules '\' separates segments too, and trailing
-// dots and spaces are dropped from each segment after ".." is resolved. Win32
-// drops them only from the last segment (and one dot from others), so this
-// over-approximates: a name can only get shorter, never climb higher.
-func cleanDrivePath(p string, windows bool) string {
-	if !windows {
-		return pathutil.Clean(p)
-	}
-	p = pathutil.Clean(strings.ReplaceAll(p, `\`, SlashSeparator))
-	segs := strings.Split(p, SlashSeparator)
-	for i, seg := range segs {
-		segs[i] = strings.TrimRight(seg, ". ")
-	}
-	return pathutil.Clean(strings.Join(segs, SlashSeparator))
-}
-
-// isStrictlyBelowDrive is isStrictlyBelow for the given platform rule.
-func isStrictlyBelowDrive(p, dir string, windows bool) bool {
-	base := strings.TrimSuffix(cleanDrivePath(dir, windows), SlashSeparator)
-	cp := cleanDrivePath(p, windows)
+	base := strings.TrimSuffix(pathutil.Clean(dir), SlashSeparator)
+	cp := pathutil.Clean(p)
 	return strings.HasPrefix(cp, base+SlashSeparator) && len(cp) > len(base)+1
-}
-
-// tmpCleanupDir returns the parent directory of filePath that a failed
-// CreateFile in the tmp volume removes, and whether removing it is allowed:
-// it must be strictly below volumeDir as the drive filesystem resolves it.
-func tmpCleanupDir(volumeDir, filePath string, windows bool) (string, bool) {
-	parent := pathutil.Dir(cleanDrivePath(filePath, windows))
-	return parent, isStrictlyBelowDrive(parent, volumeDir, windows)
-}
-
-// isDeleteFileTarget reports whether deleteFile may remove or trash
-// deletePath: only when it is strictly below basePath as the drive
-// filesystem resolves both, so that neither the volume nor anything outside
-// it is removed.
-func isDeleteFileTarget(basePath, deletePath string, windows bool) bool {
-	if basePath == "" || deletePath == "" {
-		return false
-	}
-	return isStrictlyBelowDrive(deletePath, basePath, windows)
 }
 
 func (s *xlStorage) checkFormatJSON() (os.FileInfo, error) {
@@ -2332,15 +2248,14 @@ func (s *xlStorage) CreateFile(ctx context.Context, origvolume, volume, path str
 		return err
 	}
 
+	parentFilePath := pathutil.Dir(filePath)
 	defer func() {
 		if err != nil {
 			// only cleanup parent path if the parent volume name is
 			// minioMetaTmpBucket, and never the tmp volume itself or
-			// anything above it, as the drive filesystem resolves it.
-			if volume == minioMetaTmpBucket {
-				if parentFilePath, ok := tmpCleanupDir(volumeDir, filePath, drivePathWindows); ok {
-					removeAll(parentFilePath)
-				}
+			// anything above it.
+			if volume == minioMetaTmpBucket && isStrictlyBelow(parentFilePath, volumeDir) {
+				removeAll(parentFilePath)
 			}
 		}
 	}()
@@ -2667,9 +2582,9 @@ func (s *xlStorage) deleteFile(basePath, deletePath string, recursive, immediate
 		return nil
 	}
 
-	// do not remove basePath, or anything that is not below it, as the
-	// drive filesystem resolves both (on Windows "bkt/\" is "bkt").
-	if !isDeleteFileTarget(basePath, deletePath, drivePathWindows) {
+	// Never remove basePath itself or anything outside it. A plain prefix
+	// test would let ".../bkt2/x" pass for base ".../bkt" (issue #82).
+	if !isStrictlyBelow(deletePath, basePath) {
 		return nil
 	}
 
@@ -3459,16 +3374,9 @@ func (s *xlStorage) ReadParts(ctx context.Context, volume string, partMetaPaths 
 
 // isUnconfinedPathElem reports whether a caller-supplied volume or path
 // element could address something outside its parent directory: it has a
-// "." or ".." segment, or it is absolute. On Windows a segment that Win32
-// would resolve to its parent, or a ':', is rejected as well.
+// "." or ".." segment, or it is absolute.
 func isUnconfinedPathElem(elem string) bool {
-	return isUnconfinedDrivePathElem(elem, drivePathWindows)
-}
-
-// isUnconfinedDrivePathElem is isUnconfinedPathElem for the given platform
-// rule. Leading '\' is rejected everywhere, which also covers UNC names.
-func isUnconfinedDrivePathElem(elem string, windows bool) bool {
-	if hasBadPathComponent(elem) || hasAmbiguousDrivePathSegment(elem, windows) {
+	if hasBadPathComponent(elem) {
 		return true
 	}
 	if strings.HasPrefix(elem, SlashSeparator) || strings.HasPrefix(elem, `\`) {
@@ -3478,22 +3386,16 @@ func isUnconfinedDrivePathElem(elem string, windows bool) bool {
 }
 
 // confinedPathJoin joins elems below baseDir and returns err unless every
-// element is confined and the result is strictly inside baseDir, as the
-// drive filesystem resolves it.
+// element is confined and the cleaned result is strictly inside baseDir.
 func confinedPathJoin(err error, baseDir string, elems ...string) (string, error) {
-	return confinedDrivePathJoin(drivePathWindows, err, baseDir, elems...)
-}
-
-// confinedDrivePathJoin is confinedPathJoin for the given platform rule.
-func confinedDrivePathJoin(windows bool, err error, baseDir string, elems ...string) (string, error) {
 	for _, elem := range elems {
-		if isUnconfinedDrivePathElem(elem, windows) {
+		if isUnconfinedPathElem(elem) {
 			return "", err
 		}
 	}
 	base := strings.TrimSuffix(pathJoin(baseDir), SlashSeparator)
 	fullPath := pathJoin(append([]string{base}, elems...)...)
-	if !isStrictlyBelowDrive(fullPath, base, windows) {
+	if !strings.HasPrefix(fullPath, base+SlashSeparator) || len(fullPath) == len(base)+1 {
 		return "", err
 	}
 	return fullPath, nil
