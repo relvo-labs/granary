@@ -15,7 +15,7 @@ clusterDomain: cluster.local
 ## See docs/maintenance/release.md for the source commit and index digest.
 image:
   repository: docker.io/neil0628/granary
-  tag: v2026.11.14
+  tag: v2026.11.22
   pullPolicy: IfNotPresent
 
 imagePullSecrets: []

@@ -1,8 +1,9 @@
 # Docker Hub image release (#39)
 
 Granary is an unofficial fork derived from MinIO, without upstream endorsement.
-As of 2026-11-15, **`docker.io/neil0628/granary:v2026.11.14` is public** for
-linux/amd64 and linux/arm64, and Helm defaults to that version. Neil's
+As of 2026-11-22, **`docker.io/neil0628/granary:v2026.11.22` is public** for
+linux/amd64 and linux/arm64, `:latest` points to it, and Helm defaults to that
+version. Neil's
 2026-11-14 decision in #39 replaces the GHCR proposal with maintainer-host
 publishing. Future releases still need qualification and owner go-ahead.
 Review the [compatibility exceptions](compatibility.md) before adopting a release.
@@ -13,14 +14,54 @@ does not make chart provisioning fully working.
 
 ## Published releases
 
+### v2026.11.22
+
+Anonymous read-back on **2026-11-22** (empty Docker config) confirmed:
+
+| Field | Value |
+| --- | --- |
+| Version image | `docker.io/neil0628/granary:v2026.11.22` |
+| Alias | `docker.io/neil0628/granary:latest` (same index at read-back) |
+| OCI index digest (both tags) | `sha256:93c512d694a2e3ce18cf271bbe17ba4b7c76e5f63e170bc71b6d3587c02caff9` |
+| linux/amd64 manifest digest | `sha256:b3cbd66caf6c42978b42ab77a74f44693c4d31b032126c4fef9d6db5a8e85965` |
+| linux/arm64 manifest digest | `sha256:0d4b91c8769db0e759d59144e4fb0babc814b38892c1c41fc7d6983dbf2f8785` |
+| Source commit | `ca652414fa81d26bea7bb116a3681c5f00cf78b2` (master) |
+| Binary banner | `granary version RELEASE.2026-11-22T04-22-56Z.v2026.11.22` |
+| Go toolchain | `1.27.4` |
+
+Changes since `v2026.11.14` (security fixes unless noted):
+
+- Authorization uses stored object tags for reads and deletes (#53, PR #65).
+- `s3:versionid` comes only from the selected request version (#67, PRs #87/#99).
+- OpenID rejects symmetric and mismatched JWT algorithms; HS256/384/512 ID
+  tokens are no longer accepted (CVE-2026-33322, #70, PR #76).
+- Auto-extract verifies streaming trailers before acknowledging (#66, PR #77).
+- S3 Select bounds CSV and JSON Lines record size (CVE-2026-39414, #73, PR #81;
+  #79, PR #89).
+- Storage confines `ReadMultiple` paths and grid RPC volume/path arguments
+  (CVE-2026-42600, #74, PR #83; #82, PRs #92/#100). Linux only; Windows path
+  semantics are tracked in #98.
+- Replication SSE headers are accepted only from replication requests
+  (CVE-2026-34204, #72, PR #86).
+- LDAP STS returns uniform auth errors and throttles failed logins
+  (CVE-2026-33419, #71, PR #93).
+- Fix: replication proxy ignores skipped targets for tag reads (#52, PR #63).
+
+Qualification: the 13 canonical local gates (including full tagged tests,
+lint and vulncheck) passed on a tree identical to the source commit; both
+platform binaries were run with `--version` and no network. No multi-node or
+live-server end-to-end test was run.
+
+### v2026.11.14
+
 Anonymous read-back on **2026-11-15** confirmed the public Docker Hub
 repository and these references for the first image release:
 
 | Field | Value |
 | --- | --- |
 | Version image | `docker.io/neil0628/granary:v2026.11.14` |
-| Alias | `docker.io/neil0628/granary:latest` (same index at read-back) |
-| OCI index digest (both tags) | `sha256:f3eba4c294bb5a445060f6ff7abb7a13e903cb19e7d54c27ad205fd2fa0052e0` |
+| Alias | `latest` pointed here until `v2026.11.22` |
+| OCI index digest | `sha256:f3eba4c294bb5a445060f6ff7abb7a13e903cb19e7d54c27ad205fd2fa0052e0` |
 | linux/amd64 manifest digest | `sha256:96b485ae28c54501da18c14613b84618cf33361a7b2e6c00815e46833cf1c9d1` |
 | linux/arm64 manifest digest | `sha256:94bf28c58cb074cdc4827f1994b7299fd31a2c82d1b272c98e5b67434d22f961` |
 | Source commit | `6ca7f2eabe5f8b5c83fab537f9d23212a6c81165` (master; includes PR #50 and PR #51) |
