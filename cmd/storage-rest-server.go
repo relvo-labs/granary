@@ -92,7 +92,9 @@ func (s *storageRESTServer) getStorage() StorageAPI {
 // hasBadBodyPath applies the "." and ".." segment check that
 // setRequestValidityMiddleware performs on URL paths and form values to
 // volume and path names carried in a request body, which the middleware
-// does not read.
+// does not read. Grid (websocket) storage handlers use it for every volume
+// and path parameter, since grid messages never pass the middleware
+// (issue #82); xlStorage checks the same arguments again.
 func hasBadBodyPath(paths ...string) bool {
 	for _, p := range paths {
 		if hasBadPathComponent(p) {
@@ -264,6 +266,9 @@ func (s *storageRESTServer) NSScannerHandler(ctx context.Context, params *nsScan
 	if params.Cache == nil {
 		return grid.NewRemoteErrString("NSScannerHandler: provided cache is nil")
 	}
+	if hasBadBodyPath(params.Cache.Info.Name) {
+		return grid.NewRemoteErr(errFileAccessDenied)
+	}
 
 	// Collect updates, stream them before the full cache is sent.
 	updates := make(chan dataUsageEntry, 1)
@@ -317,6 +322,9 @@ func (s *storageRESTServer) MakeVolBulkHandler(w http.ResponseWriter, r *http.Re
 func (s *storageRESTServer) StatVolHandler(params *grid.MSS) (*VolInfo, *grid.RemoteErr) {
 	if !s.checkID(params.Get(storageRESTDiskID)) {
 		return nil, grid.NewRemoteErr(errDiskNotFound)
+	}
+	if hasBadBodyPath(params.Get(storageRESTVolume)) {
+		return nil, grid.NewRemoteErr(errFileAccessDenied)
 	}
 	info, err := s.getStorage().StatVol(context.Background(), params.Get(storageRESTVolume))
 	if err != nil {
@@ -374,6 +382,9 @@ func (s *storageRESTServer) DeleteVersionHandler(p *DeleteVersionHandlerParams) 
 	volume := p.Volume
 	filePath := p.FilePath
 	forceDelMarker := p.ForceDelMarker
+	if hasBadBodyPath(volume, filePath) {
+		return np, grid.NewRemoteErr(errFileAccessDenied)
+	}
 
 	opts := DeleteOptions{}
 	err := s.getStorage().DeleteVersion(context.Background(), volume, filePath, p.FI, forceDelMarker, opts)
@@ -389,6 +400,9 @@ func (s *storageRESTServer) ReadVersionHandlerWS(params *grid.MSS) (*FileInfo, *
 	volume := params.Get(storageRESTVolume)
 	filePath := params.Get(storageRESTFilePath)
 	versionID := params.Get(storageRESTVersionID)
+	if hasBadBodyPath(origvolume, volume, filePath) {
+		return nil, grid.NewRemoteErr(errFileAccessDenied)
+	}
 
 	healing, err := strconv.ParseBool(params.Get(storageRESTHealing))
 	if err != nil {
@@ -454,6 +468,9 @@ func (s *storageRESTServer) WriteMetadataHandler(p *MetadataHandlerParams) (np g
 	volume := p.Volume
 	filePath := p.FilePath
 	origvolume := p.OrigVolume
+	if hasBadBodyPath(origvolume, volume, filePath) {
+		return np, grid.NewRemoteErr(errFileAccessDenied)
+	}
 
 	err := s.getStorage().WriteMetadata(context.Background(), origvolume, volume, filePath, p.FI)
 	return np, grid.NewRemoteErr(err)
@@ -466,6 +483,9 @@ func (s *storageRESTServer) UpdateMetadataHandler(p *MetadataHandlerParams) (gri
 	}
 	volume := p.Volume
 	filePath := p.FilePath
+	if hasBadBodyPath(volume, filePath) {
+		return grid.NewNPErr(errFileAccessDenied)
+	}
 
 	return grid.NewNPErr(s.getStorage().UpdateMetadata(context.Background(), volume, filePath, p.FI, p.UpdateOpts))
 }
@@ -477,6 +497,9 @@ func (s *storageRESTServer) CheckPartsHandler(ctx context.Context, p *CheckParts
 	}
 	volume := p.Volume
 	filePath := p.FilePath
+	if hasBadBodyPath(volume, filePath, p.FI.DataDir) {
+		return grid.NewRemoteErr(errFileAccessDenied)
+	}
 
 	resp, err := s.getStorage().CheckParts(ctx, volume, filePath, p.FI)
 	if err != nil {
@@ -493,6 +516,9 @@ func (s *storageRESTServer) WriteAllHandler(p *WriteAllHandlerParams) (grid.NoPa
 
 	volume := p.Volume
 	filePath := p.FilePath
+	if hasBadBodyPath(volume, filePath) {
+		return grid.NewNPErr(errFileAccessDenied)
+	}
 
 	return grid.NewNPErr(s.getStorage().WriteAll(context.Background(), volume, filePath, p.Buf))
 }
@@ -505,6 +531,9 @@ func (s *storageRESTServer) ReadAllHandler(p *ReadAllHandlerParams) (*grid.Bytes
 
 	volume := p.Volume
 	filePath := p.FilePath
+	if hasBadBodyPath(volume, filePath) {
+		return nil, grid.NewRemoteErr(errFileAccessDenied)
+	}
 
 	buf, err := s.getStorage().ReadAll(context.Background(), volume, filePath)
 	return grid.NewBytesWith(buf), grid.NewRemoteErr(err)
@@ -536,6 +565,9 @@ func (s *storageRESTServer) ReadXLHandlerWS(params *grid.MSS) (*RawFileInfo, *gr
 
 	volume := params.Get(storageRESTVolume)
 	filePath := params.Get(storageRESTFilePath)
+	if hasBadBodyPath(volume, filePath) {
+		return nil, grid.NewRemoteErr(errFileAccessDenied)
+	}
 	rf, err := s.getStorage().ReadXL(context.Background(), volume, filePath, false)
 	if err != nil {
 		return nil, grid.NewRemoteErr(err)
@@ -655,6 +687,9 @@ func (s *storageRESTServer) ListDirHandler(ctx context.Context, params *grid.MSS
 	volume := params.Get(storageRESTVolume)
 	dirPath := params.Get(storageRESTDirPath)
 	origvolume := params.Get(storageRESTOrigVolume)
+	if hasBadBodyPath(origvolume, volume, dirPath) {
+		return grid.NewRemoteErr(errFileAccessDenied)
+	}
 	count, err := strconv.Atoi(params.Get(storageRESTCount))
 	if err != nil {
 		return grid.NewRemoteErr(err)
@@ -672,6 +707,9 @@ func (s *storageRESTServer) ListDirHandler(ctx context.Context, params *grid.MSS
 func (s *storageRESTServer) DeleteFileHandler(p *DeleteFileHandlerParams) (grid.NoPayload, *grid.RemoteErr) {
 	if !s.checkID(p.DiskID) {
 		return grid.NewNPErr(errDiskNotFound)
+	}
+	if hasBadBodyPath(p.Volume, p.FilePath) {
+		return grid.NewNPErr(errFileAccessDenied)
 	}
 	return grid.NewNPErr(s.getStorage().Delete(context.Background(), p.Volume, p.FilePath, p.Opts))
 }
@@ -726,6 +764,9 @@ func (s *storageRESTServer) RenameDataHandler(p *RenameDataHandlerParams) (*Rena
 		return nil, grid.NewRemoteErr(errDiskNotFound)
 	}
 
+	if hasBadBodyPath(p.SrcVolume, p.SrcPath, p.DstVolume, p.DstPath, p.FI.DataDir) {
+		return nil, grid.NewRemoteErr(errFileAccessDenied)
+	}
 	resp, err := s.getStorage().RenameData(context.Background(), p.SrcVolume, p.SrcPath, p.FI, p.DstVolume, p.DstPath, p.Opts)
 	return &resp, grid.NewRemoteErr(err)
 }
@@ -741,6 +782,9 @@ func (s *storageRESTServer) RenameFileHandler(p *RenameFileHandlerParams) (grid.
 	if !s.checkID(p.DiskID) {
 		return grid.NewNPErr(errDiskNotFound)
 	}
+	if hasBadBodyPath(p.SrcVolume, p.SrcFilePath, p.DstVolume, p.DstFilePath) {
+		return grid.NewNPErr(errFileAccessDenied)
+	}
 	return grid.NewNPErr(s.getStorage().RenameFile(context.Background(), p.SrcVolume, p.SrcFilePath, p.DstVolume, p.DstFilePath))
 }
 
@@ -748,6 +792,9 @@ func (s *storageRESTServer) RenameFileHandler(p *RenameFileHandlerParams) (grid.
 func (s *storageRESTServer) RenamePartHandler(p *RenamePartHandlerParams) (grid.NoPayload, *grid.RemoteErr) {
 	if !s.checkID(p.DiskID) {
 		return grid.NewNPErr(errDiskNotFound)
+	}
+	if hasBadBodyPath(p.SrcVolume, p.SrcFilePath, p.DstVolume, p.DstFilePath, p.SkipParent) {
+		return grid.NewNPErr(errFileAccessDenied)
 	}
 	return grid.NewNPErr(s.getStorage().RenamePart(context.Background(), p.SrcVolume, p.SrcFilePath, p.DstVolume, p.DstFilePath, p.Meta, p.SkipParent))
 }

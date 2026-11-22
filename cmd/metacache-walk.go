@@ -82,6 +82,11 @@ func (s *xlStorage) WalkDir(ctx context.Context, opts WalkDirOptions, wr io.Writ
 	if err != nil {
 		return err
 	}
+	// BaseDir is joined below the volume; the grid WalkDir request is not
+	// checked by setRequestValidityMiddleware (issue #82).
+	if err = checkPathArgs(opts.BaseDir); err != nil {
+		return err
+	}
 
 	if !skipAccessChecks(opts.Bucket) {
 		// Stat a volume entry.
@@ -449,6 +454,9 @@ func (s *storageRESTServer) WalkDirHandler(ctx context.Context, payload []byte, 
 
 	if !s.checkID(opts.DiskID) {
 		return grid.NewRemoteErr(errDiskNotFound)
+	}
+	if hasBadBodyPath(opts.Bucket, opts.BaseDir) {
+		return grid.NewRemoteErr(errFileAccessDenied)
 	}
 
 	ctx, cancel := context.WithCancel(ctx)

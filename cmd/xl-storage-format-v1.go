@@ -37,8 +37,12 @@ const (
 // Valid - tells us if the format is sane by validating
 // format version and erasure coding information.
 func (m *xlMetaV1Object) valid() bool {
+	// DataDir is joined below the object directory when the version is
+	// read or deleted, so it must be empty or a valid data directory name
+	// ("legacy" or a UUID), never a path (issue #82).
 	return isXLMetaFormatValid(m.Version, m.Format) &&
-		isXLMetaErasureInfoValid(m.Erasure.DataBlocks, m.Erasure.ParityBlocks)
+		isXLMetaErasureInfoValid(m.Erasure.DataBlocks, m.Erasure.ParityBlocks) &&
+		(m.DataDir == "" || isValidMetaDataDir(m.DataDir))
 }
 
 // Verifies if the backend format metadata is sane by validating
