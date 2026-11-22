@@ -21,7 +21,6 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -109,7 +108,6 @@ func TestJWTHMACType(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fmt.Println(token)
 
 	u1, err := xnet.ParseHTTPURL(server.URL)
 	if err != nil {
@@ -145,9 +143,12 @@ func TestJWTHMACType(t *testing.T) {
 		},
 	}
 
+	// A token signed with HMAC using the OIDC client secret must never be
+	// accepted: anybody who knows the client secret could otherwise forge
+	// arbitrary identities (CVE-2026-33322).
 	var claims jwtgo.MapClaims
-	if err = cfg.Validate(t.Context(), DummyRoleARN, token, "", "", claims); err != nil {
-		t.Fatal(err)
+	if err = cfg.Validate(t.Context(), DummyRoleARN, token, "", "", claims); err == nil {
+		t.Fatal("HMAC-signed token was accepted")
 	}
 }
 
