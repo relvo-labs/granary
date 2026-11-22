@@ -398,7 +398,7 @@ func newFileInfo(object string, dataBlocks, parityBlocks int) (fi FileInfo) {
 
 // ReadMultipleReq contains information of multiple files to read from disk.
 type ReadMultipleReq struct {
-	Bucket       string   `msg:"bk"`           // Bucket. Can be empty if multiple buckets.
+	Bucket       string   `msg:"bk"`           // Bucket. Must name one volume; Prefix and Files must stay inside it.
 	Prefix       string   `msg:"pr,omitempty"` // Shared prefix of all files. Can be empty. Will be joined to filename without modification.
 	Files        []string `msg:"fl"`           // Individual files to read.
 	MaxSize      int64    `msg:"ms"`           // Return error if size is exceed.

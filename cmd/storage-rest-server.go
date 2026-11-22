@@ -89,6 +89,19 @@ func (s *storageRESTServer) getStorage() StorageAPI {
 	return getStorageViaEndpoint(s.endpoint)
 }
 
+// hasBadBodyPath applies the "." and ".." segment check that
+// setRequestValidityMiddleware performs on URL paths and form values to
+// volume and path names carried in a request body, which the middleware
+// does not read.
+func hasBadBodyPath(paths ...string) bool {
+	for _, p := range paths {
+		if hasBadPathComponent(p) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *storageRESTServer) writeErrorResponse(w http.ResponseWriter, err error) {
 	err = unwrapAll(err)
 	switch err {
@@ -543,6 +556,10 @@ func (s *storageRESTServer) ReadPartsHandler(w http.ResponseWriter, r *http.Requ
 		s.writeErrorResponse(w, err)
 		return
 	}
+	if hasBadBodyPath(preq.Paths...) {
+		s.writeErrorResponse(w, errFileAccessDenied)
+		return
+	}
 
 	done := keepHTTPResponseAlive(w)
 	infos, err := s.getStorage().ReadParts(r.Context(), volume, preq.Paths...)
@@ -679,6 +696,10 @@ func (s *storageRESTServer) DeleteVersionsHandler(w http.ResponseWriter, r *http
 		dst := &versions[i]
 		if err := dst.DecodeMsg(decoder); err != nil {
 			s.writeErrorResponse(w, err)
+			return
+		}
+		if hasBadBodyPath(dst.Name) {
+			s.writeErrorResponse(w, errFileAccessDenied)
 			return
 		}
 	}
@@ -1278,6 +1299,10 @@ func (s *storageRESTServer) DeleteBulkHandler(w http.ResponseWriter, r *http.Req
 		s.writeErrorResponse(w, err)
 		return
 	}
+	if hasBadBodyPath(req.Paths...) {
+		s.writeErrorResponse(w, errFileAccessDenied)
+		return
+	}
 
 	volume := r.Form.Get(storageRESTVolume)
 	keepHTTPResponseAlive(w)(s.getStorage().DeleteBulk(r.Context(), volume, req.Paths...))
@@ -1302,6 +1327,10 @@ func (s *storageRESTServer) ReadMultiple(w http.ResponseWriter, r *http.Request)
 	err := req.DecodeMsg(mr)
 	if err != nil {
 		rw.CloseWithError(err)
+		return
+	}
+	if hasBadBodyPath(req.Bucket, req.Prefix) || hasBadBodyPath(req.Files...) {
+		rw.CloseWithError(errFileAccessDenied)
 		return
 	}
 
