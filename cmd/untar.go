@@ -109,7 +109,8 @@ type untarOptions struct {
 }
 
 // disconnectReader will ensure that no reads can take place on
-// the upstream reader after close has been called.
+// the upstream reader after close has been called. Close waits for
+// a Read that is in progress to return.
 type disconnectReader struct {
 	r  io.Reader
 	mu sync.Mutex
@@ -132,7 +133,16 @@ func (d *disconnectReader) Close() error {
 }
 
 func untar(ctx context.Context, r io.Reader, putObject func(reader io.Reader, info os.FileInfo, name string) error, o untarOptions) error {
-	bf := bufio.NewReader(r)
+	// Decompressors may read r from their own goroutines, and canceling
+	// or closing them does not always wait for a Read in progress (the
+	// bzip2 scanner keeps reading ahead after the tar terminator). The
+	// caller may keep reading r once untar returns, e.g. to verify a
+	// streaming upload's final chunk and trailer, so hand r back only
+	// after every decompressor Read has finished and no new one can
+	// start. Deferred first, this runs after the cleanups below.
+	src := &disconnectReader{r: r}
+	defer src.Close()
+	bf := bufio.NewReader(src)
 	switch f := detect(bf); f {
 	case formatGzip:
 		gz, err := gzip.NewReader(bf)

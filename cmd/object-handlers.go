@@ -2637,9 +2637,12 @@ func (api objectAPIHandlers) PutObjectExtractHandler(w http.ResponseWriter, r *h
 		return
 	}
 
-	if rAuthType == authTypeStreamingUnsignedTrailer {
-		// A tar reader stops at the archive terminator. Consume the final
-		// chunk and trailer as well so the upload checksum is verified.
+	switch rAuthType {
+	case authTypeStreamingSigned, authTypeStreamingSignedTrailer, authTypeStreamingUnsignedTrailer:
+		// A tar reader stops at the archive terminator. Consume the rest of
+		// the stream, including the final chunk and any trailer, so chunk
+		// signatures, framing and the trailing checksum are verified before
+		// success is acknowledged, as PutObject does.
 		if _, err = io.Copy(io.Discard, hreader); err != nil {
 			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 			return
