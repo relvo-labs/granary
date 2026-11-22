@@ -45,7 +45,15 @@ Changes since `v2026.11.14` (security fixes unless noted):
   (CVE-2026-34204, #72, PR #86).
 - LDAP STS returns uniform auth errors and throttles failed logins
   (CVE-2026-33419, #71, PR #93).
+- `s3:x-amz-content-sha256` policy conditions use only the single signed and
+  verified value, including presigned requests (PR #65).
+- Streaming uploads return non-EOF trailer read errors instead of treating
+  them as end of stream (#49, PR #55).
+- Console default CSP restricts images to the same origin (#37, PR #59);
+  remote help images in the console no longer load under the default policy.
 - Fix: replication proxy ignores skipped targets for tag reads (#52, PR #63).
+- Build: build and release entries enforce the patched Go compiler and version
+  stamping (#38, #26, #27, #14, PR #57).
 
 Qualification: the 13 canonical local gates (including full tagged tests,
 lint and vulncheck) passed on a tree identical to the source commit; both
