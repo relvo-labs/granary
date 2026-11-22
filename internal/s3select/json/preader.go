@@ -118,16 +118,46 @@ func (r *PReader) nextSplit(skip int, dst []byte) ([]byte, error) {
 			return dst, io.EOF
 		}
 	}
-	// Read until next line.
-	in, err := r.buf.ReadBytes('\n')
-	dst = append(dst, in...)
-	return dst, err
+	// Blocks always end on a line boundary, so the line we are completing
+	// starts after the last newline inside the skipped bytes.
+	lineLen := len(dst) - (bytes.LastIndexByte(dst, '\n') + 1)
+
+	// Read until next line, but never buffer more than jsonMaxLineSize bytes
+	// for a single line (issue #79, the JSON Lines sibling of CVE-2026-39414):
+	// an input without newlines would otherwise be read into one allocation
+	// until EOF.
+	for {
+		in, err := r.buf.ReadSlice('\n')
+		dst = append(dst, in...)
+		lineLen += len(in)
+		switch err {
+		case bufio.ErrBufferFull:
+			if lineLen > jsonMaxLineSize {
+				return nil, errOverMaxRecordSize()
+			}
+			continue
+		case nil:
+			lineLen-- // the newline itself is not part of the line
+		}
+		if lineLen > jsonMaxLineSize {
+			return nil, errOverMaxRecordSize()
+		}
+		return dst, err
+	}
 }
 
 // jsonSplitSize is the size of each block.
 // Blocks will read this much and find the first following newline.
 // 128KB appears to be a very reasonable default.
 const jsonSplitSize = 128 << 10
+
+// jsonMaxLineSize is the maximum length in bytes of a single JSON Lines input
+// line, excluding its newline. It matches the S3 Select maxCharsPerRecord
+// limit of 1 MB that is also enforced on output records (see
+// OverMaxRecordSize in package s3select) and the CSV reader's per-line limit.
+// Memory per split stays bounded to jsonSplitSize + jsonMaxLineSize + one
+// bufio buffer.
+const jsonMaxLineSize = 1 << 20
 
 // startReaders will read the header if needed and spin up a parser
 // and a number of workers based on GOMAXPROCS.

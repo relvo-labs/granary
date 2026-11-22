@@ -17,6 +17,8 @@
 
 package json
 
+import "errors"
+
 type s3Error struct {
 	code       string
 	message    string
@@ -50,6 +52,15 @@ func errInvalidJSONType(err error) *s3Error {
 		message:    "The JsonType is invalid. Only DOCUMENT and LINES are supported.",
 		statusCode: 400,
 		cause:      err,
+	}
+}
+
+func errOverMaxRecordSize() *s3Error {
+	return &s3Error{
+		code:       "OverMaxRecordSize",
+		message:    "The length of a record in the input or result is greater than maxCharsPerRecord of 1 MB.",
+		statusCode: 400,
+		cause:      errors.New("json line exceeds maximum record size"),
 	}
 }
 
