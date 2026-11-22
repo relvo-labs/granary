@@ -80,7 +80,12 @@ func (api objectAPIHandlers) NewMultipartUploadHandler(w http.ResponseWriter, r 
 		return
 	}
 
-	if s3Error := checkRequestAuthType(ctx, r, policy.PutObjectAction, bucket, object); s3Error != ErrNone {
+	if s3Error := authenticateRequest(ctx, r, policy.PutObjectAction); s3Error != ErrNone {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+		return
+	}
+	setRequestObjectTags(r, r.Header.Get(xhttp.AmzObjectTagging))
+	if s3Error := authorizeObjectTagRequest(ctx, r, objectAPI, policy.PutObjectAction, bucket, object); s3Error != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 		return
 	}
@@ -98,6 +103,10 @@ func (api objectAPIHandlers) NewMultipartUploadHandler(w http.ResponseWriter, r 
 			return
 		}
 	}
+
+	// Replication-only SSE headers are honored only for authorized replication requests.
+	sseReplication := r.Header.Get(xhttp.AmzBucketReplicationStatus) == replication.Replica.String() &&
+		isAuthorizedReplicationRequest(ctx, r, bucket, object)
 
 	encMetadata := map[string]string{}
 
@@ -117,7 +126,6 @@ func (api objectAPIHandlers) NewMultipartUploadHandler(w http.ResponseWriter, r 
 			return
 		}
 
-		_, sourceReplReq := r.Header[xhttp.MinIOSourceReplicationRequest]
 		ssecRepHeaders := []string{
 			"X-Minio-Replication-Server-Side-Encryption-Seal-Algorithm",
 			"X-Minio-Replication-Server-Side-Encryption-Sealed-Key",
@@ -130,7 +138,7 @@ func (api objectAPIHandlers) NewMultipartUploadHandler(w http.ResponseWriter, r 
 				break
 			}
 		}
-		if !ssecRep || !sourceReplReq {
+		if !ssecRep || !sseReplication {
 			if err = setEncryptionMetadata(r, bucket, object, encMetadata); err != nil {
 				writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 				return
@@ -146,6 +154,9 @@ func (api objectAPIHandlers) NewMultipartUploadHandler(w http.ResponseWriter, r 
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
+	}
+	if sseReplication {
+		extractSSEReplicationMetadata(r.Header, metadata)
 	}
 
 	if objTags := r.Header.Get(xhttp.AmzObjectTagging); objTags != "" {
@@ -273,7 +284,11 @@ func (api objectAPIHandlers) CopyObjectPartHandler(w http.ResponseWriter, r *htt
 		return
 	}
 
-	if s3Error := checkRequestAuthType(ctx, r, policy.PutObjectAction, dstBucket, dstObject); s3Error != ErrNone {
+	if s3Error := authenticateRequest(ctx, r, policy.PutObjectAction); s3Error != ErrNone {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+		return
+	}
+	if s3Error := authorizeObjectTagRequest(ctx, r, objectAPI, policy.PutObjectAction, dstBucket, dstObject); s3Error != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 		return
 	}
@@ -306,10 +321,10 @@ func (api objectAPIHandlers) CopyObjectPartHandler(w http.ResponseWriter, r *htt
 		}
 	}
 
-	if s3Error := checkRequestAuthType(ctx, r, policy.GetObjectAction, srcBucket, srcObject); s3Error != ErrNone {
-		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
-		return
-	}
+	// The original headers and destination permissions were checked above.
+	// Source permissions are checked with stored tags in CheckPrecondFn.
+	reqInfo := logger.GetReqInfo(ctx)
+	reqInfo.BucketName, reqInfo.ObjectName, reqInfo.VersionID = srcBucket, srcObject, vid
 
 	uploadID := r.Form.Get(xhttp.UploadID)
 	partIDString := r.Form.Get(xhttp.PartNumber)
@@ -362,11 +377,22 @@ func (api objectAPIHandlers) CopyObjectPartHandler(w http.ResponseWriter, r *htt
 		}
 	}
 
+	sourceAuthChecked := false
 	checkCopyPartPrecondFn := func(o ObjectInfo) bool {
+		sourceAuthChecked = true
+		// Preserve destination RequestObjectTag inputs on the original request.
+		authReq := r.Clone(r.Context())
+		setRequestObjectTags(authReq, "")
+		setExistingObjectTagsForVersion(authReq, o.UserTags, srcOpts.VersionID)
+		if s3Error := authorizeRequest(ctx, authReq, policy.GetObjectAction); s3Error != ErrNone {
+			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+			return true
+		}
 		if _, err := DecryptObjectInfo(&o, r); err != nil {
 			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 			return true
 		}
+
 		if checkCopyObjectPartPreconditions(ctx, w, r, o) {
 			return true
 		}
@@ -381,6 +407,22 @@ func (api objectAPIHandlers) CopyObjectPartHandler(w http.ResponseWriter, r *htt
 	getOpts.CheckPrecondFn = checkCopyPartPrecondFn
 	gr, err := getObjectNInfo(ctx, srcBucket, srcObject, rs, r.Header, getOpts)
 	if err != nil {
+		if !sourceAuthChecked {
+			authReq := r.Clone(r.Context())
+			setRequestObjectTags(authReq, "")
+			setExistingObjectTagsForVersion(authReq, "", srcOpts.VersionID)
+			// Some data/range errors bypass the callback even when metadata
+			// is available. Use that version's tags before exposing the error.
+			authOpts := getOpts
+			authOpts.CheckPrecondFn = nil
+			if info, infoErr := objectAPI.GetObjectInfo(ctx, srcBucket, srcObject, authOpts); infoErr == nil {
+				setExistingObjectTagsForVersion(authReq, info.UserTags, srcOpts.VersionID)
+			}
+			if s3Error := authorizeRequest(ctx, authReq, policy.GetObjectAction); s3Error != ErrNone {
+				writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+				return
+			}
+		}
 		if isErrPreconditionFailed(err) {
 			return
 		}
@@ -671,11 +713,6 @@ func (api objectAPIHandlers) PutObjectPartHandler(w http.ResponseWriter, r *http
 		reader    io.Reader = r.Body
 		s3Error   APIErrorCode
 	)
-	if s3Error = isPutActionAllowed(ctx, rAuthType, bucket, object, r, policy.PutObjectAction); s3Error != ErrNone {
-		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
-		return
-	}
-
 	switch rAuthType {
 	case authTypeStreamingSigned, authTypeStreamingSignedTrailer:
 		// Initialize stream signature verifier.
@@ -705,6 +742,17 @@ func (api objectAPIHandlers) PutObjectPartHandler(w http.ResponseWriter, r *http
 		if !skipContentSha256Cksum(r) {
 			sha256hex = getContentSha256Cksum(r, serviceS3)
 		}
+	}
+
+	tagErr := loadExistingObjectTags(ctx, r, objectAPI, bucket, object)
+	if s3Error = isPutActionAllowed(ctx, rAuthType, bucket, object, r, policy.PutObjectAction); s3Error != ErrNone {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+		return
+	}
+
+	if tagErr != nil {
+		writeErrorResponse(ctx, w, toAPIError(ctx, tagErr), r.URL)
+		return
 	}
 
 	if err := enforceBucketQuotaHard(ctx, bucket, size); err != nil {
@@ -930,7 +978,11 @@ func (api objectAPIHandlers) CompleteMultipartUploadHandler(w http.ResponseWrite
 		return
 	}
 
-	if s3Error := checkRequestAuthType(ctx, r, policy.PutObjectAction, bucket, object); s3Error != ErrNone {
+	if s3Error := authenticateRequest(ctx, r, policy.PutObjectAction); s3Error != ErrNone {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+		return
+	}
+	if s3Error := authorizeObjectTagRequest(ctx, r, objectAPI, policy.PutObjectAction, bucket, object); s3Error != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 		return
 	}
@@ -1124,7 +1176,11 @@ func (api objectAPIHandlers) AbortMultipartUploadHandler(w http.ResponseWriter, 
 	}
 	abortMultipartUpload := objectAPI.AbortMultipartUpload
 
-	if s3Error := checkRequestAuthType(ctx, r, policy.AbortMultipartUploadAction, bucket, object); s3Error != ErrNone {
+	if s3Error := authenticateRequest(ctx, r, policy.AbortMultipartUploadAction); s3Error != ErrNone {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+		return
+	}
+	if s3Error := authorizeObjectTagRequest(ctx, r, objectAPI, policy.AbortMultipartUploadAction, bucket, object); s3Error != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 		return
 	}
@@ -1168,7 +1224,11 @@ func (api objectAPIHandlers) ListObjectPartsHandler(w http.ResponseWriter, r *ht
 		return
 	}
 
-	if s3Error := checkRequestAuthType(ctx, r, policy.ListMultipartUploadPartsAction, bucket, object); s3Error != ErrNone {
+	if s3Error := authenticateRequest(ctx, r, policy.ListMultipartUploadPartsAction); s3Error != ErrNone {
+		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
+		return
+	}
+	if s3Error := authorizeObjectTagRequest(ctx, r, objectAPI, policy.ListMultipartUploadPartsAction, bucket, object); s3Error != ErrNone {
 		writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Error), r.URL)
 		return
 	}

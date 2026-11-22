@@ -45,19 +45,7 @@ const unsignedPayloadTrailer = "STREAMING-UNSIGNED-PAYLOAD-TRAILER"
 // skipContentSha256Cksum returns true if caller needs to skip
 // payload checksum, false if not.
 func skipContentSha256Cksum(r *http.Request) bool {
-	var (
-		v  []string
-		ok bool
-	)
-
-	if isRequestPresignedSignatureV4(r) {
-		v, ok = r.Form[xhttp.AmzContentSha256]
-		if !ok {
-			v, ok = r.Header[xhttp.AmzContentSha256]
-		}
-	} else {
-		v, ok = r.Header[xhttp.AmzContentSha256]
-	}
+	v, ok := contentSha256Value(r)
 
 	// Skip if no header was set.
 	if !ok {
@@ -66,7 +54,7 @@ func skipContentSha256Cksum(r *http.Request) bool {
 
 	// If x-amz-content-sha256 is set and the value is not
 	// 'UNSIGNED-PAYLOAD' we should validate the content sha256.
-	switch v[0] {
+	switch v {
 	case unsignedPayload, unsignedPayloadTrailer:
 		return true
 	case emptySHA256:
@@ -96,35 +84,42 @@ func getContentSha256Cksum(r *http.Request, stype serviceType) string {
 		return hex.EncodeToString(sum256[:])
 	}
 
-	var (
-		defaultSha256Cksum string
-		v                  []string
-		ok                 bool
-	)
+	// We found 'X-Amz-Content-Sha256' return the captured value.
+	if v, ok := contentSha256Value(r); ok {
+		return v
+	}
 
+	// We couldn't find 'X-Amz-Content-Sha256'. Presigned requests default to
+	// 'UNSIGNED-PAYLOAD', signed requests to sha256([]byte("")).
+	if isRequestPresignedSignatureV4(r) {
+		return unsignedPayload
+	}
+	return emptySHA256
+}
+
+// contentSha256Value returns the single 'X-Amz-Content-Sha256' value SigV4
+// signs and verifies: the first query value for a presigned request (falling
+// back to the header), the first header value otherwise. Later duplicates are
+// neither signed nor checked against the payload, so callers that need the
+// request's content hash, such as policy conditions, must use this value.
+func contentSha256Value(r *http.Request) (string, bool) {
+	var (
+		v  []string
+		ok bool
+	)
 	// For a presigned request we look at the query param for sha256.
 	if isRequestPresignedSignatureV4(r) {
-		// X-Amz-Content-Sha256, if not set in presigned requests, checksum
-		// will default to 'UNSIGNED-PAYLOAD'.
-		defaultSha256Cksum = unsignedPayload
 		v, ok = r.Form[xhttp.AmzContentSha256]
 		if !ok {
 			v, ok = r.Header[xhttp.AmzContentSha256]
 		}
 	} else {
-		// X-Amz-Content-Sha256, if not set in signed requests, checksum
-		// will default to sha256([]byte("")).
-		defaultSha256Cksum = emptySHA256
 		v, ok = r.Header[xhttp.AmzContentSha256]
 	}
-
-	// We found 'X-Amz-Content-Sha256' return the captured value.
-	if ok {
-		return v[0]
+	if !ok || len(v) == 0 {
+		return "", false
 	}
-
-	// We couldn't find 'X-Amz-Content-Sha256'.
-	return defaultSha256Cksum
+	return v[0], true
 }
 
 // isValidRegion - verify if incoming region value is valid with configured Region.

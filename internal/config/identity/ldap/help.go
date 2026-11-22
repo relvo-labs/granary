@@ -103,6 +103,30 @@ var (
 			Type:        "on|off",
 		},
 		config.HelpKV{
+			Key:         LoginFailureUserLimit,
+			Description: `failed LDAP logins per username within login_failure_window before further attempts for that username are refused, 0 disables` + defaultHelpPostfix(LoginFailureUserLimit),
+			Optional:    true,
+			Type:        "number",
+		},
+		config.HelpKV{
+			Key:         LoginFailureIPLimit,
+			Description: `failed LDAP logins per source IP within login_failure_window before further attempts from that IP are refused, 0 disables` + defaultHelpPostfix(LoginFailureIPLimit),
+			Optional:    true,
+			Type:        "number",
+		},
+		config.HelpKV{
+			Key:         LoginFailureWindow,
+			Description: `window, starting when the first failed attempt began, over which failed LDAP logins are counted and refused once a limit is reached` + defaultHelpPostfix(LoginFailureWindow),
+			Optional:    true,
+			Type:        "duration",
+		},
+		config.HelpKV{
+			Key:         LoginFailureMinResponseTime,
+			Description: `minimum time a rejected LDAP STS login takes, so that response time does not reveal whether the account exists, 0s disables, at most 30s` + defaultHelpPostfix(LoginFailureMinResponseTime),
+			Optional:    true,
+			Type:        "duration",
+		},
+		config.HelpKV{
 			Key:         config.Comment,
 			Description: config.DefaultComment,
 			Optional:    true,
