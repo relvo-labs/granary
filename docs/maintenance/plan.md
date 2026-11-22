@@ -10,10 +10,10 @@ with Docker Hub `docker.io/neil0628/granary` images. The owner’s later
 2026-11-14 decision in issue #39 supersedes the initial GHCR plan: publishing
 runs on the maintainer host with local buildx for linux/amd64 and linux/arm64;
 Actions performs manual dry-run builds only. Credentials stay on the host,
-with no repository secret. The public `docker.io/neil0628/granary:v2026.11.14`
-image is published for linux/amd64 and linux/arm64; anonymous read-back on
-2026-11-15 confirmed `:latest` points to the same index. No git tag or GitHub
-Release was created. Future releases still require their own qualification
+with no repository secret. Public `docker.io/neil0628/granary` images
+`v2026.11.14` and `v2026.11.22` are published for linux/amd64 and linux/arm64;
+anonymous read-back on 2026-11-22 confirmed `:latest` points to the
+`v2026.11.22` index. No git tag or GitHub Release was created. Future releases still require their own qualification
 and owner go-ahead. See [release.md](release.md).
 This plan does not authorize merging pull requests, deploying services, or
 changing production data.

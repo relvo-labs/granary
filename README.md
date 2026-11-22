@@ -23,7 +23,7 @@ migrations or recovery. See the [CI runbook](docs/maintenance/ci.md) for gates
 and known boundaries, including the [stringer coverage gap (#13)](https://github.com/relvo-labs/granary/issues/13),
 manual heavy integrations and pending hosted evidence.
 
-As of **2026-11-15**, `docker.io/neil0628/granary:v2026.11.14` is public for
+As of **2026-11-22**, `docker.io/neil0628/granary:v2026.11.22` is public for
 linux/amd64 and linux/arm64; `:latest` points to the same image index. No git
 tag or GitHub Release was created. See the [published release record](docs/maintenance/release.md#published-releases)
 for the source commit, digests and binary version. Upstream `minio/minio`
@@ -171,12 +171,12 @@ The root [Dockerfile](Dockerfile) builds `granary` from this checkout with Go
 1.27.4. To inspect the published release, use its version tag and index digest:
 
 ```sh
-docker pull docker.io/neil0628/granary:v2026.11.14@sha256:f3eba4c294bb5a445060f6ff7abb7a13e903cb19e7d54c27ad205fd2fa0052e0
-docker run --rm docker.io/neil0628/granary:v2026.11.14@sha256:f3eba4c294bb5a445060f6ff7abb7a13e903cb19e7d54c27ad205fd2fa0052e0 --version
+docker pull docker.io/neil0628/granary:v2026.11.22@sha256:93c512d694a2e3ce18cf271bbe17ba4b7c76e5f63e170bc71b6d3587c02caff9
+docker run --rm docker.io/neil0628/granary:v2026.11.22@sha256:93c512d694a2e3ce18cf271bbe17ba4b7c76e5f63e170bc71b6d3587c02caff9 --version
 ```
 
 The [Helm chart](helm/granary) defaults to
-`docker.io/neil0628/granary:v2026.11.14`. Its post-install bucket/user/policy
+`docker.io/neil0628/granary:v2026.11.22`. Its post-install bucket/user/policy
 jobs still depend on the unavailable `quay.io/minio/mc` image
 ([#33](https://github.com/relvo-labs/granary/issues/33)); chart provisioning is
 not fully working. Self-update and background update checks are disabled;

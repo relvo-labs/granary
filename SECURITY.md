@@ -7,9 +7,10 @@ MinIO, Inc. This policy concerns this fork's source and dependencies.
 ## Maintenance scope
 
 The fork focuses on source maintenance, dependency security, CI and
-compatibility. As of **2026-11-14**, it has no GitHub releases and no published
-supported-version matrix. Planned releases will use `vYYYY.MM.DD` tags; until
-one exists, fixes land on the default branch only.
+compatibility. As of **2026-11-22**, the latest image release is
+`docker.io/neil0628/granary:v2026.11.22`; there are no GitHub releases and no
+published supported-version matrix. Fixes land on the default branch and are
+included in the next `vYYYY.MM.DD` image release.
 Upstream MinIO releases and images do not establish a supported fork version.
 There is no guaranteed response time, fix schedule or enterprise support SLA.
 The [CI runbook](docs/maintenance/ci.md) records validation boundaries;

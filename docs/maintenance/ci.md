@@ -188,7 +188,7 @@ comment. The digests were read on 2026-11-14 with anonymous
 | `golang:1.27.4-bookworm` | `sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea` |
 | `debian:bookworm-slim` | `sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc` |
 
-`ci-helm-lint` uses `helm/granary`; its server image tag is `v2026.11.14`
+`ci-helm-lint` uses `helm/granary`; its server image tag is `v2026.11.22`
 from the public Docker Hub `docker.io/neil0628/granary` repository. See the
 [published release record](release.md#published-releases) for digests and source
 identity. The [release runbook](release.md) describes host-local publishing

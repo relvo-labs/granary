@@ -4,8 +4,8 @@ Granary is an unofficial fork derived from MinIO, without affiliation with or
 endorsement by MinIO, Inc. Upstream copyright and license notices are retained.
 
 The default server image is the public
-`docker.io/neil0628/granary:v2026.11.14` for linux/amd64 and linux/arm64.
-Chart version `0.1.1` uses appVersion `v2026.11.14`; see the
+`docker.io/neil0628/granary:v2026.11.22` for linux/amd64 and linux/arm64.
+Chart version `0.1.2` uses appVersion `v2026.11.22`; see the
 [published release record](../../docs/maintenance/release.md#published-releases)
 for the source commit, index digest and binary banner.
 
