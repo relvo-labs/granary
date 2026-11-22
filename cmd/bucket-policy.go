@@ -18,6 +18,7 @@
 package cmd
 
 import (
+	"context"
 	"encoding/json"
 	"maps"
 	"net/http"
@@ -30,6 +31,7 @@ import (
 	miniogopolicy "github.com/minio/minio-go/v7/pkg/policy"
 	"github.com/minio/minio-go/v7/pkg/tags"
 	"github.com/minio/pkg/v3/policy"
+	"github.com/minio/pkg/v3/policy/condition"
 	"github.com/relvo-labs/granary/internal/auth"
 	"github.com/relvo-labs/granary/internal/handlers"
 	xhttp "github.com/relvo-labs/granary/internal/http"
@@ -75,6 +77,95 @@ func getSTSConditionValues(r *http.Request, lc string, cred auth.Credentials) ma
 	return m
 }
 
+// objectTagConditions is server-owned policy input. It is never imported from
+// HTTP condition names, and does not alter headers that were authenticated.
+type objectTagConditions struct {
+	existing  string
+	request   string
+	versionID *string
+}
+
+type objectTagConditionKey struct{}
+
+func setExistingObjectTags(r *http.Request, userTags string) {
+	values, _ := r.Context().Value(objectTagConditionKey{}).(objectTagConditions)
+	values.existing = userTags
+	*r = *r.WithContext(context.WithValue(r.Context(), objectTagConditionKey{}, values))
+}
+
+// Selected versions supplied by copy headers or multi-delete XML are not the
+// destination request's versionId query parameter.
+func setExistingObjectTagsForVersion(r *http.Request, userTags, versionID string) {
+	setExistingObjectTags(r, userTags)
+	values, _ := r.Context().Value(objectTagConditionKey{}).(objectTagConditions)
+	values.versionID = &versionID
+	*r = *r.WithContext(context.WithValue(r.Context(), objectTagConditionKey{}, values))
+}
+
+func setRequestObjectTags(r *http.Request, userTags string) {
+	values, _ := r.Context().Value(objectTagConditionKey{}).(objectTagConditions)
+	values.request = userTags
+	*r = *r.WithContext(context.WithValue(r.Context(), objectTagConditionKey{}, values))
+}
+
+// Reserve names before importing raw headers/forms, including encoded aliases.
+func reservedConditionName(name string) string {
+	if decoded, err := url.QueryUnescape(name); err == nil {
+		name = decoded
+	}
+	name = strings.ToLower(name)
+	if prefix, rest, ok := strings.Cut(name, ":"); ok {
+		switch prefix {
+		case "aws", "s3", "jwt", "ldap", "sts", "svc":
+			name = rest
+		}
+	}
+	return name
+}
+
+func reservedTagCondition(name string) bool {
+	name = reservedConditionName(name)
+	return name == "existingobjecttag" || strings.HasPrefix(name, "existingobjecttag/") ||
+		name == "requestobjecttag" || strings.HasPrefix(name, "requestobjecttag/") ||
+		name == "requestobjecttagkeys"
+}
+
+var reservedConditionNames = func() map[string]bool {
+	names := map[string]bool{
+		"versionid": true, "object-lock-mode": true, "object-lock-legal-hold": true,
+		"object-lock-retain-until-date": true, "object-lock-remaining-retention-days": true,
+		"x-amz-signature-age": true,
+	}
+	for _, key := range condition.CommonKeys {
+		names[reservedConditionName(key.Name())] = true
+	}
+	return names
+}()
+
+func reservedConditionInput(name string, claims map[string]any) bool {
+	if reservedTagCondition(name) || reservedConditionNames[reservedConditionName(name)] {
+		return true
+	}
+	for key := range claims {
+		if reservedConditionName(name) == reservedConditionName(strings.TrimPrefix(key, "ldap")) {
+			return true
+		}
+	}
+	return false
+}
+
+// contentSHA256ConditionValues returns only the payload hash the SigV4
+// verifier selected (see contentSha256Value): the first query value for
+// presigned requests, the first header value otherwise. A presigned request
+// signs only its query, so its header value is not authenticated, and values
+// repeated after the first are neither signed nor checked against the body.
+func contentSHA256ConditionValues(r *http.Request) []string {
+	if value, ok := contentSha256Value(r); ok {
+		return []string{value}
+	}
+	return nil
+}
+
 func getConditionValues(r *http.Request, lc string, cred auth.Credentials) map[string][]string {
 	currTime := UTCNow()
 
@@ -105,6 +196,10 @@ func getConditionValues(r *http.Request, lc string, cred auth.Credentials) map[s
 		if u, err := url.Parse(r.Header.Get(xhttp.AmzCopySource)); err == nil {
 			vid = u.Query().Get(xhttp.VersionID)
 		}
+	}
+
+	if values, ok := r.Context().Value(objectTagConditionKey{}).(objectTagConditions); ok && values.versionID != nil {
+		vid = *values.versionID
 	}
 
 	authType := getRequestAuthType(r)
@@ -154,23 +249,15 @@ func getConditionValues(r *http.Request, lc string, cred auth.Credentials) map[s
 	}
 
 	cloneHeader := r.Header.Clone()
-	if v := cloneHeader.Get("x-amz-signature-age"); v != "" {
-		args["signatureAge"] = []string{v}
-		cloneHeader.Del("x-amz-signature-age")
+	if age, ok := r.Context().Value(signatureAgeContextKey{}).(string); ok {
+		args["signatureAge"] = []string{age}
 	}
+	cloneHeader.Del("x-amz-signature-age")
 
-	if userTags := cloneHeader.Get(xhttp.AmzObjectTagging); userTags != "" {
-		tag, _ := tags.ParseObjectTags(userTags)
-		if tag != nil {
-			tagMap := tag.ToMap()
-			keys := make([]string, 0, len(tagMap))
-			for k, v := range tagMap {
-				args[pathJoin("ExistingObjectTag", k)] = []string{v}
-				args[pathJoin("RequestObjectTag", k)] = []string{v}
-				keys = append(keys, k)
-			}
-			args["RequestObjectTagKeys"] = keys
-		}
+	// Tag conditions are filled from typed server state below, never this header.
+	cloneHeader.Del(xhttp.AmzObjectTagging)
+	if values := contentSHA256ConditionValues(r); len(values) > 0 {
+		args["x-amz-content-sha256"] = values
 	}
 
 	for _, objLock := range []string{
@@ -185,7 +272,7 @@ func getConditionValues(r *http.Request, lc string, cred auth.Credentials) map[s
 	}
 
 	for key, values := range cloneHeader {
-		if strings.EqualFold(key, xhttp.AmzObjectTagging) {
+		if strings.EqualFold(key, xhttp.AmzObjectTagging) || reservedConditionInput(key, claims) {
 			continue
 		}
 		if existingValues, found := args[key]; found {
@@ -198,18 +285,10 @@ func getConditionValues(r *http.Request, lc string, cred auth.Credentials) map[s
 	cloneURLValues := make(url.Values, len(r.Form))
 	maps.Copy(cloneURLValues, r.Form)
 
-	for _, objLock := range []string{
-		xhttp.AmzObjectLockMode,
-		xhttp.AmzObjectLockLegalHold,
-		xhttp.AmzObjectLockRetainUntilDate,
-	} {
-		if values, ok := cloneURLValues[objLock]; ok {
-			args[strings.TrimPrefix(objLock, "X-Amz-")] = values
-		}
-		cloneURLValues.Del(objLock)
-	}
-
 	for key, values := range cloneURLValues {
+		if strings.EqualFold(key, xhttp.AmzObjectTagging) || reservedConditionInput(key, claims) {
+			continue
+		}
 		if existingValues, found := args[key]; found {
 			args[key] = append(existingValues, values...)
 		} else {
@@ -221,6 +300,9 @@ func getConditionValues(r *http.Request, lc string, cred auth.Credentials) map[s
 	//
 	// Add all string claims
 	for k, v := range claims {
+		if reservedTagCondition(strings.TrimPrefix(k, "ldap")) {
+			continue
+		}
 		vStr, ok := v.(string)
 		if ok {
 			// Trim any LDAP specific prefix
@@ -248,6 +330,25 @@ func getConditionValues(r *http.Request, lc string, cred auth.Credentials) map[s
 	if _, ok := args["groups"]; !ok {
 		if len(groups) > 0 {
 			args["groups"] = groups
+		}
+	}
+
+	tagValues, _ := r.Context().Value(objectTagConditionKey{}).(objectTagConditions)
+	for _, input := range []struct {
+		namespace string
+		value     string
+	}{{"ExistingObjectTag", tagValues.existing}, {"RequestObjectTag", tagValues.request}} {
+		tagSet, err := tags.ParseObjectTags(input.value)
+		if err != nil || tagSet == nil {
+			continue
+		}
+		var keys []string
+		for key, value := range tagSet.ToMap() {
+			args[input.namespace+"/"+key] = []string{value}
+			keys = append(keys, key)
+		}
+		if input.namespace == "RequestObjectTag" && len(keys) > 0 {
+			args["RequestObjectTagKeys"] = keys
 		}
 	}
 
