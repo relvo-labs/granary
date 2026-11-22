@@ -104,6 +104,10 @@ func (api objectAPIHandlers) NewMultipartUploadHandler(w http.ResponseWriter, r 
 		}
 	}
 
+	// Replication-only SSE headers are honored only for authorized replication requests.
+	sseReplication := r.Header.Get(xhttp.AmzBucketReplicationStatus) == replication.Replica.String() &&
+		isAuthorizedReplicationRequest(ctx, r, bucket, object)
+
 	encMetadata := map[string]string{}
 
 	if crypto.Requested(r.Header) {
@@ -122,7 +126,6 @@ func (api objectAPIHandlers) NewMultipartUploadHandler(w http.ResponseWriter, r 
 			return
 		}
 
-		_, sourceReplReq := r.Header[xhttp.MinIOSourceReplicationRequest]
 		ssecRepHeaders := []string{
 			"X-Minio-Replication-Server-Side-Encryption-Seal-Algorithm",
 			"X-Minio-Replication-Server-Side-Encryption-Sealed-Key",
@@ -135,7 +138,7 @@ func (api objectAPIHandlers) NewMultipartUploadHandler(w http.ResponseWriter, r 
 				break
 			}
 		}
-		if !ssecRep || !sourceReplReq {
+		if !ssecRep || !sseReplication {
 			if err = setEncryptionMetadata(r, bucket, object, encMetadata); err != nil {
 				writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 				return
@@ -151,6 +154,9 @@ func (api objectAPIHandlers) NewMultipartUploadHandler(w http.ResponseWriter, r 
 	if err != nil {
 		writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 		return
+	}
+	if sseReplication {
+		extractSSEReplicationMetadata(r.Header, metadata)
 	}
 
 	if objTags := r.Header.Get(xhttp.AmzObjectTagging); objTags != "" {

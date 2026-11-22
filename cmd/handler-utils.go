@@ -29,6 +29,7 @@ import (
 
 	"github.com/minio/madmin-go/v3"
 	xnet "github.com/minio/pkg/v3/net"
+	"github.com/minio/pkg/v3/policy"
 	"github.com/relvo-labs/granary/internal/auth"
 	"github.com/relvo-labs/granary/internal/handlers"
 	xhttp "github.com/relvo-labs/granary/internal/http"
@@ -84,13 +85,9 @@ var supportedHeaders = []string{
 	xhttp.AmzObjectTagging,
 	"expires",
 	xhttp.AmzBucketReplicationStatus,
-	"X-Minio-Replication-Server-Side-Encryption-Sealed-Key",
-	"X-Minio-Replication-Server-Side-Encryption-Seal-Algorithm",
-	"X-Minio-Replication-Server-Side-Encryption-Iv",
-	"X-Minio-Replication-Encrypted-Multipart",
-	"X-Minio-Replication-Actual-Object-Size",
-	ReplicationSsecChecksumHeader,
 	// Add more supported headers here.
+	// Replication-only headers (replicationToInternalHeaders) must not be
+	// listed here; see extractSSEReplicationMetadata.
 }
 
 // mapping of internal headers to allowed replication headers
@@ -103,7 +100,9 @@ var validSSEReplicationHeaders = map[string]string{
 	// Add more supported headers here.
 }
 
-// mapping of replication headers to internal headers
+// mapping of replication headers to internal headers. These headers carry
+// sealed SSE keys and sizes of replicated objects and are honored only for
+// authorized replication requests (GHSA-3rh2-v3gr-35p9).
 var replicationToInternalHeaders = map[string]string{
 	"X-Minio-Replication-Server-Side-Encryption-Sealed-Key":     "X-Minio-Internal-Server-Side-Encryption-Sealed-Key",
 	"X-Minio-Replication-Server-Side-Encryption-Seal-Algorithm": "X-Minio-Internal-Server-Side-Encryption-Seal-Algorithm",
@@ -207,11 +206,7 @@ func extractMetadataFromMime(ctx context.Context, v textproto.MIMEHeader, m map[
 	for _, supportedHeader := range supportedHeaders {
 		value, ok := nv[http.CanonicalHeaderKey(supportedHeader)]
 		if ok {
-			if v, ok := replicationToInternalHeaders[supportedHeader]; ok {
-				m[v] = strings.Join(value, ",")
-			} else {
-				m[supportedHeader] = strings.Join(value, ",")
-			}
+			m[supportedHeader] = strings.Join(value, ",")
 		}
 	}
 
@@ -228,6 +223,27 @@ func extractMetadataFromMime(ctx context.Context, v textproto.MIMEHeader, m map[
 		}
 	}
 	return nil
+}
+
+// isAuthorizedReplicationRequest reports whether r is marked as server-side
+// replication traffic and its caller may replicate objects into bucket.
+func isAuthorizedReplicationRequest(ctx context.Context, r *http.Request, bucket, object string) bool {
+	if _, ok := r.Header[xhttp.MinIOSourceReplicationRequest]; !ok {
+		return false
+	}
+	return isPutActionAllowed(ctx, getRequestAuthType(r), bucket, object, r, policy.ReplicateObjectAction) == ErrNone
+}
+
+// extractSSEReplicationMetadata maps replication-only headers to the internal
+// metadata they describe. Callers must have verified the request with
+// isAuthorizedReplicationRequest: these values become sealed keys and sizes
+// that ordinary clients must never set (GHSA-3rh2-v3gr-35p9).
+func extractSSEReplicationMetadata(h http.Header, m map[string]string) {
+	for replicationHeader, internalKey := range replicationToInternalHeaders {
+		if value, ok := h[http.CanonicalHeaderKey(replicationHeader)]; ok {
+			m[internalKey] = strings.Join(value, ",")
+		}
+	}
 }
 
 // Returns access credentials in the request Authorization header.

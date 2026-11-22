@@ -2002,6 +2002,10 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(s3Err), r.URL)
 			return
 		}
+		if _, ok := r.Header[xhttp.MinIOSourceReplicationRequest]; ok {
+			// Replicated SSE metadata is accepted only after the ReplicateObject check above.
+			extractSSEReplicationMetadata(r.Header, metadata)
+		}
 		metadata[ReservedMetadataPrefixLower+ReplicaStatus] = replication.Replica.String()
 		metadata[ReservedMetadataPrefixLower+ReplicaTimestamp] = UTCNow().Format(time.RFC3339Nano)
 		defer globalReplicationStats.Load().UpdateReplicaStat(bucket, size)
@@ -2637,9 +2641,12 @@ func (api objectAPIHandlers) PutObjectExtractHandler(w http.ResponseWriter, r *h
 		return
 	}
 
-	if rAuthType == authTypeStreamingUnsignedTrailer {
-		// A tar reader stops at the archive terminator. Consume the final
-		// chunk and trailer as well so the upload checksum is verified.
+	switch rAuthType {
+	case authTypeStreamingSigned, authTypeStreamingSignedTrailer, authTypeStreamingUnsignedTrailer:
+		// A tar reader stops at the archive terminator. Consume the rest of
+		// the stream, including the final chunk and any trailer, so chunk
+		// signatures, framing and the trailing checksum are verified before
+		// success is acknowledged, as PutObject does.
 		if _, err = io.Copy(io.Discard, hreader); err != nil {
 			writeErrorResponse(ctx, w, toAPIError(ctx, err), r.URL)
 			return
